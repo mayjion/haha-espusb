@@ -79,3 +79,10 @@ I (554) example_main: Initializing wear levelling
 I (584) example_main: USB Composite initialization DONE
 I (584) main_task: Returned from app_main()
 ```
+cd /home/may/esp/esp-idf/
+. ./export.sh
+cd /home/may/esp/esp-idf/examples/peripherals/usb/device/
+idf.py set-target esp32s2
+idf.py menuconfig
+idf.py build
+idf.py -p /dev/ttyACM0 flash

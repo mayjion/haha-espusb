@@ -36,11 +36,11 @@
 #include "freertos/queue.h"
 #include "esp_task_wdt.h"
 
-#define BASE_PATH "/usb"
+#define BASE_PATH "/USB"
 #define QUEUE_SIZE 50
 #define RX_TIMEOUT_MS 1
 #define FLUSH_TIMEOUT_MS 10
-#define TEST_FILE_PATH "/usb/esp/test.txt"
+#define TEST_FILE_PATH "/USB/FUNLIGHT/readme.txt"
 #define DEFAULT_ESP_WIFI_SSID "FUNLIGHT"
 #define DEFAULT_ESP_WIFI_PASS "funlight"
 #define ESP_WIFI_CHANNEL 1
@@ -77,6 +77,9 @@ static QueueHandle_t app_queue;
 static QueueHandle_t notification_queue;
 static uint32_t last_baudrate = 0;
 static uint32_t current_baud_rate = DEFAULT_BAUD_RATE;
+static uint8_t current_stop_bit = 1;
+static uint8_t current_data_bit = 8;
+static uint8_t current_parity_bit = 0;
 static uint8_t debug_mode = 0; // Enabled for debugging
 static char log_buffer[256];
 static SemaphoreHandle_t client_mutex = NULL;
@@ -177,27 +180,27 @@ void tinyusb_cdc_line_state_cb(tinyusb_cdcacm_itf_t itf, cdcacm_event_t *event)
     }
 }
 
-static void write_baudrate_to_file(uint32_t baudrate, uint8_t stop_bits, uint8_t parity, uint8_t data_bits)
-{
-    if (baudrate == last_baudrate) {
-        CDC_LOG(1, "Baudrate unchanged: %lu, skipping file write\n", baudrate);
-        return;
-    }
-    if (tinyusb_msc_storage_in_use_by_usb_host()) {
-        CDC_LOG(1, "MSC in use by USB host, skipping file write\n");
-        return;
-    }
-    FILE *f = fopen(TEST_FILE_PATH, "a");
-    if (f == NULL) {
-        CDC_LOG(1, "Failed to open %s for appending: %s\n", TEST_FILE_PATH, strerror(errno));
-        return;
-    }
-    fprintf(f, "Baudrate: %lu, StopBits: %u, Parity: %u, DataBits: %u\n",
-            baudrate, stop_bits, parity, data_bits);
-    fclose(f);
-    last_baudrate = baudrate;
-    CDC_LOG(1, "Wrote baudrate info to %s: %lu\n", TEST_FILE_PATH, baudrate);
-}
+// static void write_baudrate_to_file(uint32_t baudrate, uint8_t stop_bits, uint8_t parity, uint8_t data_bits)
+// {
+//     if (baudrate == last_baudrate) {
+//         CDC_LOG(1, "Baudrate unchanged: %lu, skipping file write\n", baudrate);
+//         return;
+//     }
+//     if (tinyusb_msc_storage_in_use_by_usb_host()) {
+//         CDC_LOG(1, "MSC in use by USB host, skipping file write\n");
+//         return;
+//     }
+//     FILE *f = fopen(TEST_FILE_PATH, "a");
+//     if (f == NULL) {
+//         CDC_LOG(1, "Failed to open %s for appending: %s\n", TEST_FILE_PATH, strerror(errno));
+//         return;
+//     }
+//     fprintf(f, "Baudrate: %lu, StopBits: %u, Parity: %u, DataBits: %u\n",
+//             baudrate, stop_bits, parity, data_bits);
+//     fclose(f);
+//     last_baudrate = baudrate;
+//     CDC_LOG(1, "Wrote baudrate info to %s: %lu\n", TEST_FILE_PATH, baudrate);
+// }
 
 static void send_to_client(client_t *client, const char *data, size_t len, const char *log_prefix)
 {
@@ -297,6 +300,10 @@ void tinyusb_cdc_line_coding_changed_callback(int itf, cdcacm_event_t *event)
             coding->p_line_coding->parity, coding->p_line_coding->data_bits, esp_get_free_heap_size());
     current_baud_rate = coding->p_line_coding->bit_rate;
     
+    current_data_bit = coding->p_line_coding->data_bits;
+    current_parity_bit = coding->p_line_coding->parity;
+    current_stop_bit = coding->p_line_coding->stop_bits;
+
     if (coding->p_line_coding->bit_rate != last_sent_baud_rate ||
         coding->p_line_coding->stop_bits != last_sent_stop_bits ||
         coding->p_line_coding->parity != last_sent_parity ||
@@ -312,8 +319,8 @@ void tinyusb_cdc_line_coding_changed_callback(int itf, cdcacm_event_t *event)
                 coding->p_line_coding->parity, coding->p_line_coding->data_bits);
         send_notification_to_clients(message);
         CDC_LOG(1, "Serial parameters changed, notification sent: %s", message);
-        write_baudrate_to_file(coding->p_line_coding->bit_rate, coding->p_line_coding->stop_bits,
-                               coding->p_line_coding->parity, coding->p_line_coding->data_bits);
+        // write_baudrate_to_file(coding->p_line_coding->bit_rate, coding->p_line_coding->stop_bits,
+        //                        coding->p_line_coding->parity, coding->p_line_coding->data_bits);
     } else {
         CDC_LOG(1, "Serial parameters unchanged, skipping notification\n");
     }
@@ -340,28 +347,32 @@ static void file_operations(void)
 {
     static bool file_initialized = false;
     if (file_initialized) return;
+
     if (tinyusb_msc_storage_in_use_by_usb_host()) {
         CDC_LOG(1, "MSC in use by USB host, skipping file operations\n");
         return;
     }
-    const char *directory = "/usb/esp";
+
+    const char *directory = "/USB/FUNLIGHT";
     const char *file_path = TEST_FILE_PATH;
     struct stat s = {0};
+
+    // 创建目录（如果不存在）
     if (stat(directory, &s) != 0) {
-        if (mkdir(directory, 0775) != 0) {
-            CDC_LOG(1, "mkdir failed with errno: %s\n", strerror(errno));
-        }
+        mkdir(directory, 0775);
     }
-    if (!file_exists(file_path)) {
-        CDC_LOG(1, "Creating file %s\n", file_path);
-        FILE *f = fopen(file_path, "w");
-        if (f == NULL) {
-            CDC_LOG(1, "Failed to open %s for writing: %s\n", file_path, strerror(errno));
-            return;
-        }
-        fprintf(f, "Hello World!\n");
-        fclose(f);
+
+    // 打开文件并覆盖内容（"w" 模式会清空已有内容）
+    FILE *f = fopen(file_path, "w");
+    if (f == NULL) {
+        CDC_LOG(1, "Failed to open %s for writing: %s\n", file_path, strerror(errno));
+        return;
     }
+
+    // 写入默认内容
+    fprintf(f, "1. 无线串口2.4G高速透传，即插即用，板载天线款传输距离可达10m~20m,外置天线款传输距离最多可达450m\n2. 默认波特率115200，一对一使用，一对多需购买一对多产品\n3. 串口工具链接：通过网盘分享的文件：链接: https://pan.baidu.com/s/1QuWzSN5s-Zb8CiqtM7e6CA 提取码: c63g \n4. 购买咨询，打开淘宝搜索: FUNLIGHT\n");
+    fclose(f);
+
     file_initialized = true;
 }
 
@@ -570,6 +581,7 @@ static void button_task(void *pvParameters)
                 char message[128];
                 snprintf(message, sizeof(message), "WIFI=%s,%s\r\n", new_ssid, new_password);
                 send_notification_to_clients(message);
+                vTaskDelay(pdMS_TO_TICKS(2000));
                 esp_err_t ret = save_wifi_credentials(new_ssid, new_password);
                 if (ret == ESP_OK) {
                     update_wifi_config(new_ssid, new_password);
@@ -758,7 +770,8 @@ static int accept_client(int listen_sock, char *addr_str, uint8_t *mac, const ch
     CDC_LOG(1, "%s Client connected: %s, MAC %02x:%02x:%02x:%02x:%02x:%02x, free heap: %zu\n",
             log_prefix, addr_str, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], esp_get_free_heap_size());
     char welcome_msg[128];
-    snprintf(welcome_msg, sizeof(welcome_msg), "Welcome! Current baud rate: %lu\n", current_baud_rate);
+    snprintf(welcome_msg, sizeof(welcome_msg), "BAUD=%lu,STOPBIT=%d,PARITY=%d,DATABIT=%d\r\n", 
+        current_baud_rate,current_stop_bit,current_parity_bit,current_data_bit);
     send(sock, welcome_msg, strlen(welcome_msg), 0);
     return sock;
 }
