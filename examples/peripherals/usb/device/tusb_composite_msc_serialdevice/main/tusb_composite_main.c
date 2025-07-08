@@ -370,7 +370,7 @@ static void file_operations(void)
     }
 
     // 写入默认内容
-    fprintf(f, "1. 无线串口2.4G高速透传，即插即用，板载天线款传输距离可达10m~20m,外置天线款传输距离最多可达450m\n2. 默认波特率115200，一对一使用，一对多需购买一对多产品\n3. 串口工具链接：通过网盘分享的文件：链接: https://pan.baidu.com/s/1QuWzSN5s-Zb8CiqtM7e6CA 提取码: c63g \n4. 购买咨询，打开淘宝搜索: FUNLIGHT\n");
+    fprintf(f, "1. 无线串口2.4G高速透传，即插即用\n2. 默认波特率115200，一对一使用\n3. 串口工具链接：通过网盘分享的文件：链接: https://pan.baidu.com/s/1QuWzSN5s-Zb8CiqtM7e6CA 提取码: c63g \n4. 购买咨询，打开淘宝搜索: FUNLIGHT无线串口\n");
     fclose(f);
 
     file_initialized = true;
