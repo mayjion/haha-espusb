@@ -41,7 +41,6 @@ components/**/sdkconfig.old
 # Example project files
 examples/**/build/
 examples/**/build_*_*/
-examples/**/sdkconfig
 examples/**/sdkconfig.old
 
 # Unit test app files

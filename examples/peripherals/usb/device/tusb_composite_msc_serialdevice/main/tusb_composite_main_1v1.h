@@ -33,18 +33,10 @@
 #define NVS_KEY_SSID "wifi_ssid"
 #define NVS_KEY_PASS "wifi_pass"
 
-#define MAX_CLIENTS 8
-
 typedef struct {
     uint8_t buf[CONFIG_TINYUSB_CDC_RX_BUFSIZE];
     size_t buf_len;
     int itf;
 } app_message_t;
-
-typedef struct {
-    int sock;              // 客户端socket，-1表示空闲
-    bool active;           // 连接活跃
-    struct sockaddr_in addr;  // 客户端地址（用于日志）
-} client_t;
 
 #endif

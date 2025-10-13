@@ -1,13 +1,10 @@
 #include "tusb_composite_main.h"
-#include <sys/select.h>
-#include <string.h>
 
 static const char *TAG = "example_main";
 static uint8_t cdc_rx_buf[CONFIG_TINYUSB_CDC_RX_BUFSIZE];
 static QueueHandle_t app_queue;
-static client_t clients[MAX_CLIENTS];  // 全局数组
-static int num_active_clients = 0;     // 活跃客户端计数
-static bool client_active = false; // 保留原变量，但可能不再用
+static int client_sock = -1;
+static bool client_active = false;
 static char cached_log_prefix[64] = "[00:00:00.000][device 0]";
 static char current_ssid[32] = DEFAULT_ESP_WIFI_SSID;
 static char current_password[64] = DEFAULT_ESP_WIFI_PASS;
@@ -75,25 +72,18 @@ void tinyusb_cdc_line_state_changed_callback(int itf, cdcacm_event_t *event) {
 }
 
 static void send_to_client(const uint8_t *data, size_t len, const char *log_prefix) {
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (clients[i].active && clients[i].sock >= 0) {
-            int sent = send(clients[i].sock, data, len, 0);
-            if (sent < 0) {
-                ESP_LOGW(TAG, "%s TCP send failed for client %d, closing", log_prefix, i);
-                close(clients[i].sock);
-                clients[i].sock = -1;
-                clients[i].active = false;
-                num_active_clients--;
-                // LED: 如果无活跃客户端，关灯
-                if (num_active_clients == 0) gpio_set_level(LED_GPIO, 0);
-            } else if (sent == len) {
-                ESP_LOGD(TAG, "%s Sent %zu bytes to client %d", log_prefix, len, i);
-            }
-        }
+    if (!client_active || client_sock < 0) return;
+    int sent = send(client_sock, data, len, 0);
+    if (sent < 0) {
+        ESP_LOGW(TAG, "%s TCP send failed, closing socket", log_prefix);
+        close(client_sock);
+        client_sock = -1;
+        client_active = false;
+        gpio_set_level(LED_GPIO, 0);
     }
-    // LED: 如果有活跃客户端，开灯
-    if (num_active_clients > 0) gpio_set_level(LED_GPIO, 1);
 }
+
+
 void tinyusb_cdc_line_coding_changed_callback(int itf, cdcacm_event_t *event) {
     cdcacm_event_line_coding_changed_data_t *coding = &event->line_coding_changed_data;
     char message[128];
@@ -199,7 +189,7 @@ static void update_wifi_config(const char *ssid, const char *password) {
             .ssid_len = strlen(ssid),
             .channel = ESP_WIFI_CHANNEL,
             .authmode = strlen(password) == 0 ? WIFI_AUTH_OPEN : WIFI_AUTH_WPA2_PSK,
-            .max_connection = MAX_CLIENTS,  
+            .max_connection = 1,
             .beacon_interval = 100,
             .pmf_cfg = { .capable = true, .required = false },
             .ftm_responder = false
@@ -220,8 +210,8 @@ static void button_task(void *pvParameters) {
             last_press_time = xTaskGetTickCount();
         } else if (!last_state && current_state) {
             TickType_t press_duration = xTaskGetTickCount() - last_press_time;
-            ESP_LOGI(TAG, "BUTTON PRESSED: %d ms, ticks:%d", press_duration / portTICK_PERIOD_MS, press_duration);
-            if (press_duration < pdMS_TO_TICKS(BUTTON_CLICK_THRESHOLD_MS) && factory_state && num_active_clients > 0) {
+            ESP_LOGI(TAG, "BUTTON PRESSED: %d, ticks:%d", press_duration,pdMS_TO_TICKS(press_duration));
+            if (press_duration < pdMS_TO_TICKS(BUTTON_CLICK_THRESHOLD_MS) && factory_state && client_active) {
                 uint8_t mac[6];
                 char new_ssid[32];
                 char new_password[64];
@@ -234,8 +224,8 @@ static void button_task(void *pvParameters) {
                 char message[128];
                 snprintf(message, sizeof(message), "WIFI=%s,%s\r\n", new_ssid, new_password);
                 send_to_client((uint8_t *)message, strlen(message), cached_log_prefix);
-                ESP_LOGI(TAG, "%s Sent WiFi credentials to %d clients: %s", cached_log_prefix, num_active_clients, message);
-                vTaskDelay(pdMS_TO_TICKS(2000));  // Ensure clients receive notification
+                ESP_LOGI(TAG, "%s Sent WiFi credentials to client: %s", cached_log_prefix, message);
+                vTaskDelay(pdMS_TO_TICKS(2000));  // Ensure client receives notification
                 esp_err_t ret = save_wifi_credentials(new_ssid, new_password);
                 if (ret == ESP_OK) {
                     update_wifi_config(new_ssid, new_password);
@@ -251,7 +241,7 @@ static void button_task(void *pvParameters) {
             }
         } else if (!last_state && !current_state) {
             TickType_t press_duration = xTaskGetTickCount() - last_press_time;
-            ESP_LOGI(TAG, "BUTTON LONG PRESSED: %d ms, ticks:%d", press_duration / portTICK_PERIOD_MS, press_duration);
+            ESP_LOGI(TAG, "BUTTON PRESSED11: %d, ticks:%d", press_duration,pdMS_TO_TICKS(press_duration));
             if (press_duration >= pdMS_TO_TICKS(BUTTON_LONG_PRESS_MS)) {
                 esp_err_t ret = clear_nvs_config();
                 if (ret == ESP_OK) {
@@ -281,7 +271,7 @@ static void wifi_init_softap(void) {
             .ssid_len = strlen(current_ssid),
             .channel = ESP_WIFI_CHANNEL,
             .authmode = strlen(current_password) == 0 ? WIFI_AUTH_OPEN : WIFI_AUTH_WPA2_PSK,
-            .max_connection = MAX_CLIENTS,  // 修改为4
+            .max_connection = 1,
             .beacon_interval = 100,
             .pmf_cfg = { .capable = true, .required = false },
             .ftm_responder = false
@@ -311,114 +301,45 @@ static void tcp_server_task(void *pvParameters) {
     int opt = 1;
     setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
     bind(listen_sock, (struct sockaddr*)&dest_addr, sizeof(dest_addr));
-    listen(listen_sock, MAX_CLIENTS);  // backlog改为MAX_CLIENTS
-
-    fd_set readfds;
-    struct timeval timeout = { .tv_sec = 1, .tv_usec = 0 };  // 1s超时，检查accept
+    listen(listen_sock, 1);
 
     while (1) {
-        FD_ZERO(&readfds);
-        FD_SET(listen_sock, &readfds);  // 监听listen_sock
-        int max_fd = listen_sock;
+        struct sockaddr_in source_addr;
+        socklen_t addr_len = sizeof(source_addr);
+        int sock = accept(listen_sock, (struct sockaddr*)&source_addr, &addr_len);
+        if (sock < 0) continue;
 
-        // 添加所有活跃客户端socket到select
-        for (int i = 0; i < MAX_CLIENTS; i++) {
-            if (clients[i].active && clients[i].sock >= 0) {
-                FD_SET(clients[i].sock, &readfds);
-                if (clients[i].sock > max_fd) max_fd = clients[i].sock;
-            }
-        }
-
-        int activity = select(max_fd + 1, &readfds, NULL, NULL, &timeout);
-        if (activity < 0) {
-            ESP_LOGE(TAG, "select error");
-            vTaskDelay(pdMS_TO_TICKS(100));
+        if (client_active) {
+            close(sock);
             continue;
         }
 
-        // 新连接
-        if (FD_ISSET(listen_sock, &readfds)) {
-            if (num_active_clients < MAX_CLIENTS) {
-                struct sockaddr_in source_addr;
-                socklen_t addr_len = sizeof(source_addr);
-                int sock = accept(listen_sock, (struct sockaddr*)&source_addr, &addr_len);
-                if (sock >= 0) {
-                    // 找空闲slot
-                    int slot = -1;
-                    for (int i = 0; i < MAX_CLIENTS; i++) {
-                        if (clients[i].sock == -1) {
-                            slot = i;
-                            break;
-                        }
-                    }
-                    if (slot != -1) {
-                        int nodelay = 1;
-                        setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
-                        int sndbuf = 4096;
-                        setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+        int nodelay = 1;
+        setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+        int sndbuf = 4096;
+        setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
 
-                        clients[slot].sock = sock;
-                        clients[slot].active = true;
-                        clients[slot].addr = source_addr;
-                        num_active_clients++;
-                        gpio_set_level(LED_GPIO, 1);  // 开灯
-                        ESP_LOGI(TAG, "Client %d connected from %s:%d, total active: %d",
-                                 slot, inet_ntoa(source_addr.sin_addr), ntohs(source_addr.sin_port), num_active_clients);
-                    } else {
-                        close(sock);
-                    }
-                }
-            } else {
-                ESP_LOGW(TAG, "Max clients reached, rejecting connection");
+        client_sock = sock;
+        client_active = true;
+        gpio_set_level(LED_GPIO, 1);
+        ESP_LOGI(TAG, "Client connected, LED on");
+
+        uint8_t rx_buffer[UART_BUF_SIZE];
+        while (client_active) {
+            int len = recv(client_sock, rx_buffer, UART_BUF_SIZE, 0);
+            if (len <= 0) break;
+            size_t queued = tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0, rx_buffer, len);
+            for (int retry = 0; retry < 5; retry++) {
+                if (tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, pdMS_TO_TICKS(CDC_FLUSH_TIMEOUT_MS)) == ESP_OK && queued == len) break;
             }
         }
 
-        // 处理客户端数据
-        for (int i = 0; i < MAX_CLIENTS; i++) {
-            if (clients[i].active && clients[i].sock >= 0 && FD_ISSET(clients[i].sock, &readfds)) {
-                uint8_t rx_buffer[UART_BUF_SIZE];
-                int len = recv(clients[i].sock, rx_buffer, UART_BUF_SIZE, 0);
-                if (len <= 0) {
-                    // 断开
-                    close(clients[i].sock);
-                    clients[i].sock = -1;
-                    clients[i].active = false;
-                    num_active_clients--;
-                    ESP_LOGI(TAG, "Client %d disconnected, total active: %d", i, num_active_clients);
-                    if (num_active_clients == 0) gpio_set_level(LED_GPIO, 0);
-                } else {
-                    // 提取IP地址最后一个数字
-                    const char *client_ip = inet_ntoa(clients[i].addr.sin_addr);
-                    const char *last_octet = strrchr(client_ip, '.') ? strrchr(client_ip, '.') + 1 : "0";
-                    char dev_prefix[16];
-                    snprintf(dev_prefix, sizeof(dev_prefix), "\r\n[dev-%s]\r\n", last_octet);
-                    size_t prefix_len = strlen(dev_prefix);
-                    // 先转发前缀到USB
-                    size_t queued_prefix = tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0, (uint8_t *)dev_prefix, prefix_len);
-                    esp_err_t flush_ret_prefix = ESP_FAIL;
-                    for (int retry = 0; retry < 5; retry++) {
-                        flush_ret_prefix = tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, pdMS_TO_TICKS(CDC_FLUSH_TIMEOUT_MS));
-                        if (flush_ret_prefix == ESP_OK && queued_prefix == prefix_len) break;
-                    }
-                    if (flush_ret_prefix != ESP_OK || queued_prefix != prefix_len) {
-                        ESP_LOGE(TAG, "Failed to send prefix '%s' from client %d to USB after retries", dev_prefix, i);
-                    }
-                    // 然后转发原数据到USB
-                    size_t queued_data = tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0, rx_buffer, len);
-                    esp_err_t flush_ret_data = ESP_FAIL;
-                    for (int retry = 0; retry < 5; retry++) {
-                        flush_ret_data = tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, pdMS_TO_TICKS(CDC_FLUSH_TIMEOUT_MS));
-                        if (flush_ret_data == ESP_OK && queued_data == len) break;
-                    }
-                    if (flush_ret_data != ESP_OK || queued_data != len) {
-                        ESP_LOGE(TAG, "Failed to forward %d bytes from client %d to USB after retries", len, i);
-                    }
-                    ESP_LOGD(TAG, "[dev-%s] Forwarded prefix and %d bytes of data from client %d to USB", last_octet, len, i);
-                }
-            }
-        }
+        close(client_sock);
+        client_sock = -1;
+        client_active = false;
+        gpio_set_level(LED_GPIO, 0);
+        ESP_LOGI(TAG, "Client disconnected, LED off");
     }
-    close(listen_sock);
 }
 
 static void button_init(void) {
@@ -468,13 +389,6 @@ static esp_err_t init_system(void) {
         return ESP_FAIL;
     }
     ESP_LOGI(TAG, "app_queue created successfully");
-
-    // 初始化clients数组
-    memset(clients, 0, sizeof(clients));
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        clients[i].sock = -1;
-        clients[i].active = false;
-    }
     return ESP_OK;
 }
 
@@ -530,9 +444,8 @@ void app_main(void) {
     }
 
     xTaskCreate(usb_device_task, "usb_dev", 8192, NULL, 10, NULL);
-    xTaskCreate(tcp_server_task, "tcp_server", 4096, NULL, 8, NULL);  // 栈大小增加到4096
+    xTaskCreate(tcp_server_task, "tcp_server", 3072, NULL, 8, NULL);
     xTaskCreate(usb_to_tcp_task, "usb_to_tcp", 3072, NULL, 9, NULL);
     xTaskCreate(button_task, "button_task", 2048, NULL, 5, NULL);
     ESP_LOGI(TAG, "Tasks created, app_main complete");
 }
-
