@@ -1,6 +1,10 @@
 #include "tusb_composite_main.h"
 #include <sys/select.h>
 #include <string.h>
+#include <fcntl.h>
+#include <errno.h>
+
+#define BROADCAST_THRESHOLD 2
 
 static const char *TAG = "example_main";
 static uint8_t cdc_rx_buf[CONFIG_TINYUSB_CDC_RX_BUFSIZE];
@@ -12,6 +16,7 @@ static char cached_log_prefix[64] = "[00:00:00.000][device 0]";
 static char current_ssid[32] = DEFAULT_ESP_WIFI_SSID;
 static char current_password[64] = DEFAULT_ESP_WIFI_PASS;
 static bool factory_state = true;
+static int udp_sock = -1;
 
 // Device descriptor
 static const tusb_desc_device_t desc_device = {
@@ -75,24 +80,46 @@ void tinyusb_cdc_line_state_changed_callback(int itf, cdcacm_event_t *event) {
 }
 
 static void send_to_client(const uint8_t *data, size_t len, const char *log_prefix) {
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (clients[i].active && clients[i].sock >= 0) {
-            int sent = send(clients[i].sock, data, len, 0);
-            if (sent < 0) {
-                ESP_LOGW(TAG, "%s TCP send failed for client %d, closing", log_prefix, i);
-                close(clients[i].sock);
-                clients[i].sock = -1;
-                clients[i].active = false;
-                num_active_clients--;
-                // LED: 如果无活跃客户端，关灯
-                if (num_active_clients == 0) gpio_set_level(LED_GPIO, 0);
-            } else if (sent == len) {
-                ESP_LOGD(TAG, "%s Sent %zu bytes to client %d", log_prefix, len, i);
+    if (num_active_clients <= BROADCAST_THRESHOLD) {
+        // Polling send via TCP for small number of clients
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            if (clients[i].active && clients[i].sock >= 0) {
+                int sent = send(clients[i].sock, data, len, 0);
+                if (sent < 0) {
+                    ESP_LOGW(TAG, "%s TCP send failed for client %d, closing", log_prefix, i);
+                    close(clients[i].sock);
+                    clients[i].sock = -1;
+                    clients[i].active = false;
+                    num_active_clients--;
+                } else if (sent == len) {
+                    ESP_LOGD(TAG, "%s Sent %zu bytes to client %d", log_prefix, len, i);
+                } else {
+                    ESP_LOGW(TAG, "%s Partial send to client %d: %d/%zu, closing", log_prefix, i, sent, len);
+                    close(clients[i].sock);
+                    clients[i].sock = -1;
+                    clients[i].active = false;
+                    num_active_clients--;
+                }
             }
         }
+    } else {
+        // Use UDP broadcast for large number of clients
+        if (udp_sock >= 0) {
+            struct sockaddr_in bcast_addr;
+            memset(&bcast_addr, 0, sizeof(bcast_addr));
+            bcast_addr.sin_family = AF_INET;
+            bcast_addr.sin_port = htons(PORT);
+            bcast_addr.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+            int sent = sendto(udp_sock, data, len, 0, (struct sockaddr*)&bcast_addr, sizeof(bcast_addr));
+            if (sent < 0) {
+                ESP_LOGE(TAG, "%s UDP broadcast failed: %s", log_prefix, strerror(errno));
+            } else {
+                ESP_LOGD(TAG, "%s Broadcast %d bytes via UDP to %d clients", log_prefix, sent, num_active_clients);
+            }
+        } else {
+            ESP_LOGW(TAG, "%s UDP socket not available, skipping broadcast", log_prefix);
+        }
     }
-    // LED: 如果有活跃客户端，开灯
-    if (num_active_clients > 0) gpio_set_level(LED_GPIO, 1);
 }
 void tinyusb_cdc_line_coding_changed_callback(int itf, cdcacm_event_t *event) {
     cdcacm_event_line_coding_changed_data_t *coding = &event->line_coding_changed_data;
@@ -361,7 +388,6 @@ static void tcp_server_task(void *pvParameters) {
                         clients[slot].active = true;
                         clients[slot].addr = source_addr;
                         num_active_clients++;
-                        gpio_set_level(LED_GPIO, 1);  // 开灯
                         ESP_LOGI(TAG, "Client %d connected from %s:%d, total active: %d",
                                  slot, inet_ntoa(source_addr.sin_addr), ntohs(source_addr.sin_port), num_active_clients);
                     } else {
@@ -385,24 +411,26 @@ static void tcp_server_task(void *pvParameters) {
                     clients[i].active = false;
                     num_active_clients--;
                     ESP_LOGI(TAG, "Client %d disconnected, total active: %d", i, num_active_clients);
-                    if (num_active_clients == 0) gpio_set_level(LED_GPIO, 0);
                 } else {
-                    // 提取IP地址最后一个数字
-                    const char *client_ip = inet_ntoa(clients[i].addr.sin_addr);
-                    const char *last_octet = strrchr(client_ip, '.') ? strrchr(client_ip, '.') + 1 : "0";
-                    char dev_prefix[16];
-                    snprintf(dev_prefix, sizeof(dev_prefix), "\r\n[dev-%s]\r\n", last_octet);
-                    size_t prefix_len = strlen(dev_prefix);
-                    // 先转发前缀到USB
-                    size_t queued_prefix = tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0, (uint8_t *)dev_prefix, prefix_len);
-                    esp_err_t flush_ret_prefix = ESP_FAIL;
-                    for (int retry = 0; retry < 5; retry++) {
-                        flush_ret_prefix = tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, pdMS_TO_TICKS(CDC_FLUSH_TIMEOUT_MS));
-                        if (flush_ret_prefix == ESP_OK && queued_prefix == prefix_len) break;
+                    if (num_active_clients > 1) {
+                        // 提取IP地址最后一个数字
+                        const char *client_ip = inet_ntoa(clients[i].addr.sin_addr);
+                        const char *last_octet = strrchr(client_ip, '.') ? strrchr(client_ip, '.') + 1 : "0";
+                        char dev_prefix[16];
+                        snprintf(dev_prefix, sizeof(dev_prefix), "\r\n[dev-%s]\r\n", last_octet);
+                        size_t prefix_len = strlen(dev_prefix);
+                        // 先转发前缀到USB
+                        size_t queued_prefix = tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0, (uint8_t *)dev_prefix, prefix_len);
+                        esp_err_t flush_ret_prefix = ESP_FAIL;
+                        for (int retry = 0; retry < 5; retry++) {
+                            flush_ret_prefix = tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, pdMS_TO_TICKS(CDC_FLUSH_TIMEOUT_MS));
+                            if (flush_ret_prefix == ESP_OK && queued_prefix == prefix_len) break;
+                        }
+                        if (flush_ret_prefix != ESP_OK || queued_prefix != prefix_len) {
+                            ESP_LOGE(TAG, "Failed to send prefix '%s' from client %d to USB after retries", dev_prefix, i);
+                        }
                     }
-                    if (flush_ret_prefix != ESP_OK || queued_prefix != prefix_len) {
-                        ESP_LOGE(TAG, "Failed to send prefix '%s' from client %d to USB after retries", dev_prefix, i);
-                    }
+     
                     // 然后转发原数据到USB
                     size_t queued_data = tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0, rx_buffer, len);
                     esp_err_t flush_ret_data = ESP_FAIL;
@@ -413,7 +441,7 @@ static void tcp_server_task(void *pvParameters) {
                     if (flush_ret_data != ESP_OK || queued_data != len) {
                         ESP_LOGE(TAG, "Failed to forward %d bytes from client %d to USB after retries", len, i);
                     }
-                    ESP_LOGD(TAG, "[dev-%s] Forwarded prefix and %d bytes of data from client %d to USB", last_octet, len, i);
+                    // ESP_LOGD(TAG, "[dev-%s] Forwarded prefix and %d bytes of data from client %d to USB", last_octet, len, i);
                 }
             }
         }
@@ -432,6 +460,22 @@ static void button_init(void) {
     ESP_ERROR_CHECK(gpio_config(&io_conf));
 }
 
+static void led_task(void *pvParameters) {
+    while (1) {
+        if (num_active_clients > 0) {
+            // 有客户端连接时，常亮
+            gpio_set_level(LED_GPIO, 1);
+            vTaskDelay(pdMS_TO_TICKS(100));  // 短暂延迟以检查状态变化
+        } else {
+            // 无客户端连接时，慢闪（亮500ms，灭500ms）
+            gpio_set_level(LED_GPIO, 1);
+            vTaskDelay(pdMS_TO_TICKS(500));
+            gpio_set_level(LED_GPIO, 0);
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+    }
+}
+
 static esp_err_t init_system(void) {
     gpio_config_t io_conf = {
         .pin_bit_mask = (1ULL << LED_GPIO),
@@ -445,7 +489,7 @@ static esp_err_t init_system(void) {
         ESP_LOGE(TAG, "GPIO config failed: %s", esp_err_to_name(ret));
         return ret;
     }
-    gpio_set_level(LED_GPIO, 0);
+    gpio_set_level(LED_GPIO, 0);  // 初始关灯，LED任务将立即处理
 
     ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -457,6 +501,17 @@ static esp_err_t init_system(void) {
         return ret;
     }
     wifi_init_softap();
+
+    // Create UDP broadcast socket
+    udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (udp_sock >= 0) {
+        int yes = 1;
+        setsockopt(udp_sock, SOL_SOCKET, SO_BROADCAST, &yes, sizeof(yes));
+        ESP_LOGI(TAG, "UDP broadcast socket created on port %d", PORT);
+    } else {
+        ESP_LOGE(TAG, "Failed to create UDP broadcast socket: %s", strerror(errno));
+    }
+
     button_init();
     esp_log_level_set(TAG, ESP_LOG_INFO);
     esp_log_level_set("tusb", ESP_LOG_DEBUG);
@@ -533,6 +588,6 @@ void app_main(void) {
     xTaskCreate(tcp_server_task, "tcp_server", 4096, NULL, 8, NULL);  // 栈大小增加到4096
     xTaskCreate(usb_to_tcp_task, "usb_to_tcp", 3072, NULL, 9, NULL);
     xTaskCreate(button_task, "button_task", 2048, NULL, 5, NULL);
+    xTaskCreate(led_task, "led_task", 1024, NULL, 1, NULL);  // 新增LED任务，低优先级，小栈
     ESP_LOGI(TAG, "Tasks created, app_main complete");
 }
-
