@@ -500,9 +500,9 @@ void app_main(void) {
     }
 
     xTaskCreatePinnedToCore(tcp_server_task, "tcp_server", 16384, NULL, 4, NULL, 1);
-    xTaskCreatePinnedToCore(usb_to_tcp_task, "usb_to_tcp", 8192, NULL, 4, NULL, 1);
+    xTaskCreatePinnedToCore(usb_to_tcp_task, "usb_to_tcp", 12288, NULL, 4, NULL, 1);
     xTaskCreatePinnedToCore(send_task, "send_task", 12288, NULL, 4, NULL, 1);
-    xTaskCreatePinnedToCore(parse_and_usb_task, "parse_usb", 8192, NULL, 4, NULL, 1);
+    xTaskCreatePinnedToCore(parse_and_usb_task, "parse_usb", 12288, NULL, 4, NULL, 1);
     xTaskCreatePinnedToCore(button_task, "button_task", 4096, NULL, 2, NULL, 0);  // Core 0 for GPIO
     xTaskCreatePinnedToCore(led_task, "led_task", 2048, NULL, 1, NULL, 0);
     ESP_LOGI(TAG, "Tasks created, app_main complete");

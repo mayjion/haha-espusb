@@ -246,7 +246,7 @@ void parse_and_usb_task(void *pvParameters) {
                     // USB output: Queue to CDC ACM
                     size_t written = tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0, payload, pay_len);
                     esp_err_t flush_ret_data = ESP_FAIL;
-                    for (int retry = 0; retry < 5; retry++) {
+                    for (int retry = 0; retry < 3; retry++) {
                         flush_ret_data = tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, pdMS_TO_TICKS(CDC_FLUSH_TIMEOUT_MS));
                         if (flush_ret_data == ESP_OK && written == pay_len) break;
                     }
@@ -256,7 +256,7 @@ void parse_and_usb_task(void *pvParameters) {
                     }
                     
                     // Optional: Send ACK/RESP back
-                    send_reliable(&active_client, PROTO_TYPE_RESP, payload, pay_len);
+                    // send_reliable(&active_client, PROTO_TYPE_RESP, payload, pay_len);
                 } else if (type == PROTO_TYPE_CMD) {
                     // Process command (placeholder)
                     ESP_LOGI("usbhandle", "CMD received, len=%u", pay_len);
