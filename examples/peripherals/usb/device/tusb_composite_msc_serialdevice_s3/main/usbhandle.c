@@ -151,7 +151,7 @@ void usb_to_tcp_task(void *pvParameters) {
 
     while (1) {
         // ADDED: Wait for notify or short timeout (1ms for low latency)
-        if (xTaskNotifyWait(0, ULONG_MAX, &notified_value, pdMS_TO_TICKS(30)) == pdTRUE || uxQueueMessagesWaiting(app_queue) > 0) {
+        if (xTaskNotifyWait(0, ULONG_MAX, &notified_value, pdMS_TO_TICKS(5)) == pdTRUE || uxQueueMessagesWaiting(app_queue) > 0) {
             esp_task_wdt_reset();  // Reset on activity
             while (xQueueReceive(app_queue, &msg, 0) == pdTRUE) {  // Drain all pending (non-blocking)
                 if (msg.buf_len > 0) {
@@ -178,7 +178,7 @@ void usb_to_tcp_task(void *pvParameters) {
                 size_t free_space = TX_BUFFER_SIZE - tx_ring.len;
                 if (to_write > free_space) {
                     to_write = free_space;
-                    ESP_LOGW(TAG, "TX ring full (%zu/%zu), truncating to %zu bytes (dropped %zu)",
+                    ESP_LOGI(TAG, "TX ring full (%zu/%zu), truncating to %zu bytes (dropped %zu)",
                              tx_ring.len, TX_BUFFER_SIZE, to_write, msg.buf_len - to_write);
                     if (to_write == 0) {
                         xSemaphoreGive(client_mutex);

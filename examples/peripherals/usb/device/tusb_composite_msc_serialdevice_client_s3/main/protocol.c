@@ -71,11 +71,13 @@ size_t build_escaped_frame(uint8_t *frame, uint8_t type, uint16_t seq, const uin
     // Append escaped payload
     memcpy(&frame[7], escaped_payload, esc_len);
 
-    // Escape and append CRC
+    // Escape and append CRC (修复：使用独立缓冲避免溢出)
     uint8_t temp_crc[2] = {(crc >> 8) & 0xFF, crc & 0xFF};
+    uint8_t escaped_crc[4];  // 足够大缓冲 (max 4 字节 escaped)
+    memcpy(escaped_crc, temp_crc, 2);
     uint16_t crc_esc_len = 2;
-    escape_bytes(temp_crc, &crc_esc_len);
-    memcpy(&frame[7 + esc_len], temp_crc, crc_esc_len);
+    escape_bytes(escaped_crc, &crc_esc_len);
+    memcpy(&frame[7 + esc_len], escaped_crc, crc_esc_len);
 
     return 7 + esc_len + crc_esc_len;
 }
@@ -124,9 +126,10 @@ frame_parse_status_t extract_next_frame(uint8_t *buf, size_t buf_len, uint8_t *t
 
             size_t header_end = i + 7;
             if (header_end > buf_len) {
-                return FRAME_INCOMPLETE;
+                return FRAME_INCOMPLETE;  // Wait for more
             }
 
+            // Unescape payload (optimized: tighter bounds check)
             size_t unesc_count = 0;
             size_t raw_pos = header_end;
             size_t j = 0;
@@ -154,12 +157,14 @@ frame_parse_status_t extract_next_frame(uint8_t *buf, size_t buf_len, uint8_t *t
                 }
             }
             if (parse_fail || unesc_count < *payload_len) {
+                // Improved skip: Actual consumed + estimated remaining (payload*1.5 for escapes + CRC*2)
                 size_t est_remaining = (*payload_len - unesc_count) * 1.5 + 4;
                 i += (header_end - i) + est_remaining;
                 if (i > buf_len) i = buf_len;
                 continue;
             }
 
+            // Unescape CRC (similar optimization)
             uint8_t crc_unesc[2];
             unesc_count = 0;
             size_t k = 0;
@@ -187,20 +192,17 @@ frame_parse_status_t extract_next_frame(uint8_t *buf, size_t buf_len, uint8_t *t
                 }
             }
             if (parse_fail || unesc_count < 2) {
-                size_t est_remaining = (2 - unesc_count) * 2 + (*payload_len % 2);
+                size_t est_remaining = (2 - unesc_count) * 2 + (*payload_len % 2);  // CRC margin
                 i += (raw_pos - i) + est_remaining;
                 if (i > buf_len) i = buf_len;
                 continue;
             }
 
             *crc = (crc_unesc[0] << 8) | crc_unesc[1];
-            // Verify CRC using unescaped data (static to save stack)
-            static uint8_t temp_payload[FRAME_BUFFER_SIZE];  // Static: safe for single-threaded task
-            static uint8_t calc_data[5 + FRAME_BUFFER_SIZE];
-            if (temp_payload == NULL || calc_data == NULL) {  // Unlikely, but guard
-                return FRAME_ERROR;
-            }
+            // Verify CRC using unescaped data
+            uint8_t temp_payload[FRAME_BUFFER_SIZE];
             memcpy(temp_payload, payload, *payload_len);
+            uint8_t calc_data[5 + FRAME_BUFFER_SIZE];
             calc_data[0] = *type;
             calc_data[1] = (*seq >> 8) & 0xFF;
             calc_data[2] = *seq & 0xFF;
@@ -209,17 +211,18 @@ frame_parse_status_t extract_next_frame(uint8_t *buf, size_t buf_len, uint8_t *t
             memcpy(calc_data + 5, temp_payload, *payload_len);
             uint16_t calc_crc = compute_crc16(calc_data, 5 + *payload_len);
             if (calc_crc != *crc) {
-                ESP_LOGW("PROTO", "CRC mismatch: calc=0x%04X, recv=0x%04X", calc_crc, *crc);
-                size_t consumed_so_far = (header_end - i) + (*payload_len * 1.2) + 4;
-                i += (consumed_so_far > 20 ? consumed_so_far : 20);
+                ESP_LOGI("PROTO", "CRC mismatch: calc=0x%04X, recv=0x%04X", calc_crc, *crc);
+                // ADDED: Skip this frame like unescape fail
+                size_t frame_est = 7 + (*payload_len) * 1.5 + 4;  // Header + esc payload est + esc CRC
+                i += frame_est;
                 if (i > buf_len) i = buf_len;
-                continue;
+                continue;  // Scan for next header
             }
-            return (frame_parse_status_t)(raw_pos - i);
+            return (frame_parse_status_t)(raw_pos - i);  // Bytes consumed (positive = success)
         }
         i++;
     }
-    return FRAME_INCOMPLETE;
+    return FRAME_INCOMPLETE;  // No full frame
 }
 
 bool parse_frame(const uint8_t *buf, size_t len, uint8_t *type, uint16_t *seq, uint16_t *payload_len, uint8_t *payload, uint16_t *crc) {

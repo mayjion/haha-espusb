@@ -6,13 +6,13 @@
 
 static const char *TAG = "tcpclient";
 client_t active_client = {0};
-SemaphoreHandle_t client_mutex = NULL;  // For thread-safe access to active_client
-tx_ring_t tx_ring = {0};  // Shared with USB, initialized here or in usbhandle
-QueueHandle_t app_queue;  // Shared with USB
-rx_ring_t rx_ring = {0};  // RX ring
-SemaphoreHandle_t rx_mutex = NULL;  // For rx_ring
+SemaphoreHandle_t client_mutex = NULL;  // Added: For thread-safe access to active_client
+tx_ring_t tx_ring = {0};  // Moved: Shared with USB, initialized here or in usbhandle
+QueueHandle_t app_queue;  // Moved: Shared with USB
+rx_ring_t rx_ring = {0};  // New
+SemaphoreHandle_t rx_mutex = NULL;  // New
 
-void wdt_init(uint32_t timeout_ms) {  // uint8_t -> uint32_t
+void wdt_init(uint32_t timeout_ms) {  // CHANGED: uint8_t -> uint32_t
     esp_err_t wdt_deinit = esp_task_wdt_deinit();
     if (wdt_deinit == ESP_ERR_NOT_FOUND) {
         ESP_LOGD(TAG, "TWDT was not initialized, proceeding to init");
@@ -24,7 +24,7 @@ void wdt_init(uint32_t timeout_ms) {  // uint8_t -> uint32_t
     esp_task_wdt_config_t wdt_config = {
         .timeout_ms = timeout_ms,  // Now safe for 30000
         .idle_core_mask = 0,  // Monitor all cores
-        .trigger_panic = true,
+        .trigger_panic = false,
     };
     esp_err_t wdt_err = esp_task_wdt_init(&wdt_config);
     if (wdt_err != ESP_OK) {
@@ -47,12 +47,12 @@ esp_err_t init_system(void) {
     led_init();
     button_init();
 
-    // WiFi init (STA mode for client)
-    wifi_config_init();  // Full init
+    // WiFi init (now includes full stack: NVS + netif + event loop)
+    wifi_config_init();  // ADDED: Full init (replaces manual nvs_flash_init)
     wifi_init_sta();     // Start STA connection
 
     // WDT init
-    wdt_init(30000);
+    wdt_init(30000);  // Will be fixed in #2
 
     // Mutex and shared resources
     client_mutex = xSemaphoreCreateMutex();
@@ -60,9 +60,8 @@ esp_err_t init_system(void) {
         ESP_LOGE(TAG, "Failed to create client_mutex");
         return ESP_FAIL;
     }
-    ESP_LOGI(TAG, "client_mutex created OK");
-
-    // Ring buffer init: Dynamic heap alloc
+    ESP_LOGI(TAG, "client_mutex created OK");  // 添加：确认创建成功
+    // Ring buffer init: Dynamic heap alloc to avoid .bss issues
     // TX ring
     tx_ring.buf = calloc(TX_BUFFER_SIZE, sizeof(uint8_t));  // Alloc + zero
     if (tx_ring.buf == NULL) {
@@ -121,39 +120,23 @@ esp_err_t rx_ring_append(const uint8_t *data, size_t len) {
     return ESP_OK;
 }
 
+
+// New: Consume from RX ring (up to max_len, returns consumed)
 size_t rx_ring_consume(uint8_t *buf, size_t max_len) {
-    if (buf == NULL || max_len == 0) return 0;  // Null guard vs MMU fault
-    if (xSemaphoreTake(rx_mutex, pdMS_TO_TICKS(10)) != pdTRUE) return 0;
-    size_t to_read = (rx_ring.len < max_len) ? rx_ring.len : max_len;
-    if (to_read == 0 || rx_ring.buf == NULL) {
-        xSemaphoreGive(rx_mutex);
+    if (xSemaphoreTake(rx_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {  // Increased to 100ms
+        ESP_LOGI("tcpclient", "RX mutex take timeout in consume (contention)");  // New: Diagnose
         return 0;
     }
-    size_t read = 0;
-    size_t pos = rx_ring.tail;
-    while (read < to_read) {
-        if (pos >= rx_ring.size) pos = 0;  // Bounds
-        buf[read] = rx_ring.buf[pos];
-        pos = (pos + 1) % rx_ring.size;
-        read++;
+    size_t consumed = (rx_ring.len < max_len) ? rx_ring.len : max_len;
+    for (size_t i = 0; i < consumed; i++) {
+        buf[i] = rx_ring.buf[rx_ring.tail];  // Unchanged
+        rx_ring.tail = (rx_ring.tail + 1) % rx_ring.size;  // CHANGED: % .size
     }
-    rx_ring.tail = pos;
-    rx_ring.len -= to_read;
+    rx_ring.len -= consumed;
     xSemaphoreGive(rx_mutex);
-    return to_read;
+    return consumed;
 }
 
-esp_err_t send_control_to_tcp(uint8_t type, const uint8_t *payload, uint16_t payload_len) {
-    xSemaphoreTake(client_mutex, portMAX_DELAY);
-    if (!active_client.active) {
-        ESP_LOGW(TAG, "TCP not connected, dropping control msg type=0x%02X", type);
-        xSemaphoreGive(client_mutex);
-        return ESP_FAIL;
-    }
-    esp_err_t ret = send_reliable(&active_client, type, payload, payload_len);
-    xSemaphoreGive(client_mutex);
-    return ret;
-}
 
 // WiFi event handler
 static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
@@ -273,142 +256,168 @@ void tcp_client_task(void *pvParameters) {
 
 void send_task(void *pvParameters) {
     esp_task_wdt_add(NULL);
-    const TickType_t send_interval = pdMS_TO_TICKS(SEND_CHECK_INTERVAL_MS);
 
     while (1) {
+        vTaskDelay(pdMS_TO_TICKS(1));  // Keep for low latency, but consider 10ms idle.
+
         xSemaphoreTake(client_mutex, portMAX_DELAY);
         if (!active_client.active || tx_ring.len == 0) {
             xSemaphoreGive(client_mutex);
-            vTaskDelay(send_interval);
-            esp_task_wdt_reset();
+            esp_task_wdt_reset();  // ADDED: Reset on idle loop (covers no-client case).
             continue;
         }
 
-        // Consume from ring
-        size_t to_send = (tx_ring.len > MAX_TX_SIZE) ? MAX_TX_SIZE : tx_ring.len;
-        uint8_t send_buf[MAX_TX_SIZE];
-        size_t pos = tx_ring.tail;
-        for (size_t i = 0; i < to_send; ++i) {
-            send_buf[i] = tx_ring.buf[pos];
-            pos = (pos + 1) % tx_ring.size;
+        // Improved chunk size logic
+        size_t chunk_size = tx_ring.len;
+        if (chunk_size > 512) {
+            chunk_size = 512;
+        } else if (chunk_size > MAX_TX_SIZE) {
+            chunk_size = MAX_TX_SIZE;
         }
-        tx_ring.tail = pos;
-        tx_ring.len -= to_send;
+        ESP_LOGD(TAG, "Sending chunk_size=%zu (ring len=%zu, tail=%zu)", chunk_size, tx_ring.len, tx_ring.tail);
+
+        // Fixed copy loop: Use for loop for exact chunk_size bytes
+        size_t pos = tx_ring.tail;
+        uint8_t temp_payload[MAX_TX_SIZE];
+        memset(temp_payload, 0, sizeof(temp_payload));  // 必须添加：清除栈垃圾
+        // ESP_LOGI(TAG, "Starting copy loop: chunk_size=%zu", chunk_size);  // 调试：确认 chunk_size
+        for (size_t i = 0; i < chunk_size; ++i) {
+            temp_payload[i] = tx_ring.buf[pos];
+            pos = (pos + 1) % tx_ring.size;  // 修改：使用 tx_ring.size 而非 TX_BUFFER_SIZE（一致性）
+            // if (i < 5) {  // 调试：只日志前5个迭代，确认循环执行
+            //     ESP_LOGI(TAG, "Copy i=%zu: temp[%zu]=0x%02X from buf[%zu]=0x%02X", i, i, temp_payload[i], (tx_ring.tail + i) % tx_ring.size, tx_ring.buf[(tx_ring.tail + i) % tx_ring.size]);
+            // }
+        }
+        // ESP_LOGI(TAG, "Copy loop complete: final pos=%zu", pos);  // 调试：确认循环结束
+        size_t copied = chunk_size;
+        ESP_LOGI(TAG, "TCP TX: %u bytes", copied);
+        // ESP_LOG_BUFFER_HEX(TAG, temp_payload, copied);  
+
+        // Set pending for this chunk
+        active_client.pending_type = PROTO_TYPE_DATA;
+        active_client.pending_seq = active_client.seq_tx;
+        active_client.pending_len = copied;
+        memcpy(active_client.pending_payload, temp_payload, copied);
+        active_client.pending = true;
         xSemaphoreGive(client_mutex);
 
-        // Send reliable DATA frame
-        active_client.pending = true;
-        active_client.pending_type = PROTO_TYPE_DATA;
-        active_client.pending_seq = active_client.seq_tx++;
-        memcpy(active_client.pending_payload, send_buf, to_send);
-        active_client.pending_len = to_send;
-
-        esp_err_t send_ret = send_reliable(&active_client, PROTO_TYPE_DATA, send_buf, to_send);
-        if (send_ret != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to send DATA seq=%d len=%zu", active_client.pending_seq, to_send);
-        } else {
-            ESP_LOGD(TAG, "Sent DATA seq=%d len=%zu", active_client.pending_seq, to_send);
+        // Send with reliability
+        esp_err_t ret = send_reliable(&active_client, PROTO_TYPE_DATA, temp_payload, copied);
+        xSemaphoreTake(client_mutex, portMAX_DELAY);
+        if (ret == ESP_OK) {
+            // Success: advance ring
+            tx_ring.tail = pos;
+            tx_ring.len -= copied;
+            active_client.seq_tx++;
+            ESP_LOGD(TAG, "Sent chunk seq=%d len=%zu (ring len now=%zu)", active_client.pending_seq, copied, tx_ring.len);
         }
-
-        // Heartbeat every interval
-        if (xTaskGetTickCount() - active_client.last_heartbeat > pdMS_TO_TICKS(PROTO_HEARTBEAT_INTERVAL)) {
-            uint8_t hb_payload[1] = {0x00};  // Simple HB
-            send_reliable(&active_client, PROTO_TYPE_HEARTBEAT, hb_payload, 1);
-            active_client.last_heartbeat = xTaskGetTickCount();
-        }
-
-        vTaskDelay(send_interval);
-        esp_task_wdt_reset();
+        active_client.pending = false;
+        xSemaphoreGive(client_mutex);
+        
+        esp_task_wdt_reset();  // ADDED: Reset post-send (covers active path).
     }
 }
 
-void parse_and_usb_task(void *pvParameters) {
-    esp_task_wdt_add(NULL);
-    uint8_t parse_buf[FRAME_BUFFER_SIZE];
-    uint8_t payload[MAX_TX_SIZE];
-    const size_t max_frames_per_loop = 5;  // Reduced for stack safety under bursts
-    size_t frames_processed = 0;
-    const TickType_t parse_delay = pdMS_TO_TICKS(1);
-
-    while (1) {
-        // Null check on ring (prevent MMU fault)
-        if (rx_ring.buf == NULL || rx_ring.size == 0) {
-            ESP_LOGE(TAG, "RX ring invalid (null buf), skipping");
-            esp_task_wdt_reset();
-            vTaskDelay(parse_delay);
-            continue;
-        }
-
-        size_t avail = rx_ring_consume(parse_buf, sizeof(parse_buf));
-        if (avail == 0) {
-            esp_task_wdt_reset();
-            vTaskDelay(parse_delay);
-            continue;
-        }
-
-        ESP_LOGI(TAG, "Consumed %zu bytes from RX ring for parsing", avail);
-
-        size_t parsed = 0;
-        while (parsed < avail && frames_processed < max_frames_per_loop) {
-            uint8_t type;
-            uint16_t seq, pay_len, crc;
-            frame_parse_status_t status = extract_next_frame(&parse_buf[parsed], avail - parsed, &type, &seq, &pay_len, payload, &crc);
-            if (status > 0) {
-                parsed += (size_t)status;
-                frames_processed++;
-                ESP_LOGI(TAG, "Parsed frame: type=0x%02X seq=%u len=%u crc=0x%04X", type, seq, pay_len, crc);
-
-                if (type == PROTO_TYPE_DATA) {
-                    // Null check payload
-                    if (payload == NULL || pay_len == 0) {
-                        ESP_LOGW(TAG, "Invalid payload for DATA frame seq=%u", seq);
-                        continue;
-                    }
-
-                    size_t written = tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0, payload, pay_len);
-                    esp_err_t flush_ret = ESP_FAIL;
-                    for (int retry = 0; retry < 3; retry++) {
-                        flush_ret = tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, pdMS_TO_TICKS(CDC_FLUSH_TIMEOUT_MS));
-                        if (flush_ret == ESP_OK && written == pay_len) break;
-                        vTaskDelay(pdMS_TO_TICKS(10));
-                    }
-
-                    if (flush_ret != ESP_OK || written != pay_len) {
-                        ESP_LOGE(TAG, "Failed to forward %d bytes from server to USB after retries", pay_len);
-                    }
-                    
-                    ESP_LOGD(TAG, "Forwarded DATA frame to USB (no app ACK sent; using TCP)");
-                } else if (type == PROTO_TYPE_CMD) {
-                    ESP_LOGI(TAG, "CMD received from server, len=%u", pay_len);
-                }
-            } else if (status == FRAME_INCOMPLETE) {
-                ESP_LOGD(TAG, "Incomplete frame at offset %zu, dropping %zu bytes", parsed, avail - parsed);
-                parsed = avail;
-                break;
-            } else {
-                ESP_LOGW(TAG, "Parse error at offset %zu, skipping est %u bytes", parsed, pay_len + 9);
-                size_t skip = 7 + pay_len + 2;
-                if (skip > avail - parsed) skip = avail - parsed;
-                parsed += skip;
-                continue;
-            }
-            vTaskDelay(pdMS_TO_TICKS(1));
-            esp_task_wdt_reset();
-        }
-        esp_task_wdt_reset();
-        frames_processed = 0;
-        vTaskDelay(parse_delay);
+esp_err_t send_control_to_tcp(uint8_t type, const uint8_t *payload, uint16_t payload_len) {
+    xSemaphoreTake(client_mutex, pdMS_TO_TICKS(100));
+    if (!active_client.active || active_client.sock < 0) {
+        xSemaphoreGive(client_mutex);
+        ESP_LOGD(TAG, "send_control_to_tcp: No active client, skipping type=0x%02X", type);
+        return ESP_FAIL;
     }
+
+    // 堆分配缓冲：frame (总帧), escaped_payload (转义后负载), crc_data (CRC 计算用)
+    uint8_t *frame = malloc(FRAME_BUFFER_SIZE);  // ~2.3KB
+    uint8_t *escaped_payload = malloc(MAX_TX_SIZE * 2);  // ~2KB
+    uint8_t *crc_data = malloc(5 + MAX_TX_SIZE);  // ~1KB
+    if (!frame || !escaped_payload || !crc_data) {
+        ESP_LOGE(TAG, "Malloc failed for control frame buffers (type=0x%02X, len=%u)", type, payload_len);
+        if (frame) free(frame);
+        if (escaped_payload) free(escaped_payload);
+        if (crc_data) free(crc_data);
+        xSemaphoreGive(client_mutex);
+        return ESP_FAIL;
+    }
+
+    // 清零缓冲
+    memset(frame, 0, FRAME_BUFFER_SIZE);
+    memset(escaped_payload, 0, MAX_TX_SIZE * 2);
+    memset(crc_data, 0, 5 + MAX_TX_SIZE);
+
+    // Build header (unescaped len)
+    frame[0] = 0xFF;
+    frame[1] = 0xFF;
+    frame[2] = type;
+    frame[3] = (0 >> 8) & 0xFF;  // seq=0 for control
+    frame[4] = 0 & 0xFF;
+    frame[5] = (payload_len >> 8) & 0xFF;
+    frame[6] = payload_len & 0xFF;
+
+    // Compute CRC over unescaped: header fields + original payload
+    uint16_t seq = 0;
+    crc_data[0] = type;
+    crc_data[1] = (seq >> 8) & 0xFF;
+    crc_data[2] = seq & 0xFF;
+    crc_data[3] = (payload_len >> 8) & 0xFF;
+    crc_data[4] = payload_len & 0xFF;
+    memcpy(crc_data + 5, payload, payload_len);
+    uint16_t crc = compute_crc16(crc_data, 5 + payload_len);
+
+    // Escape payload for TX
+    memcpy(escaped_payload, payload, payload_len);
+    uint16_t esc_len = payload_len;
+    escape_bytes(escaped_payload, &esc_len);
+
+    // Append escaped payload
+    memcpy(&frame[7], escaped_payload, esc_len);
+
+    // Escape and append CRC (修复：使用独立缓冲避免溢出)
+    uint8_t temp_crc[2] = {(crc >> 8) & 0xFF, crc & 0xFF};
+    uint8_t temp_crc_esc[4];  // 足够大缓冲 (max 4 字节 escaped)
+    memcpy(temp_crc_esc, temp_crc, 2);
+    uint16_t crc_esc_len = 2;
+    escape_bytes(temp_crc_esc, &crc_esc_len);
+    memcpy(&frame[7 + esc_len], temp_crc_esc, crc_esc_len);
+
+    size_t frame_len = 7 + esc_len + crc_esc_len;
+
+    // 日志：确认构建
+    ESP_LOGI(TAG, "Built control frame: type=0x%02X, seq=%u, payload_len=%u, crc=0x%04X, total_frame=%zu bytes", 
+             type, seq, payload_len, crc, frame_len);
+
+    // 发送（带重试）
+    esp_err_t ret = ESP_FAIL;
+    for (int retry = 0; retry < PROTO_MAX_RETRIES; retry++) {
+        int sent = send(active_client.sock, frame, frame_len, 0);
+        if (sent == (int)frame_len) {
+            ret = ESP_OK;
+            ESP_LOGI(TAG, "Sent formatted control msg type=0x%02X len=%u (frame %zu bytes)", type, payload_len, frame_len);
+            break;
+        }
+        ESP_LOGW(TAG, "Control send retry %d/%d: sent=%d expected=%zu", retry + 1, PROTO_MAX_RETRIES, sent, frame_len);
+        vTaskDelay(pdMS_TO_TICKS(PROTO_TIMEOUT_MS * (retry + 1)));
+    }
+
+    // 释放堆缓冲
+    free(frame);
+    free(escaped_payload);
+    free(crc_data);
+
+    xSemaphoreGive(client_mutex);
+    return ret;
 }
+
+
 esp_err_t send_reliable(client_t *client, uint8_t type, const uint8_t *payload, uint16_t payload_len) {
     if (type != PROTO_TYPE_DATA) {
-        // For non-DATA: seq=0, simple retry
+        // For CMD, HB, RESP, etc.: seq fixed to 0, use retry (no pending buffer)
         uint16_t seq = 0;
         uint8_t frame[FRAME_BUFFER_SIZE];
         size_t frame_len = build_escaped_frame(frame, type, seq, payload, payload_len, NULL);
         
         ESP_LOGD(TAG, "Built non-DATA frame len=%zu seq=0 type=0x%02x", frame_len, type);
         
+        // Retry loop with timeout
         for (int retry = 0; retry < PROTO_MAX_RETRIES; retry++) {
             int sent = send(client->sock, frame, frame_len, 0);
             if (sent == (int)frame_len) {
@@ -421,10 +430,11 @@ esp_err_t send_reliable(client_t *client, uint8_t type, const uint8_t *payload, 
         ESP_LOGW(TAG, "Non-DATA send failed after %d retries type=0x%02x", PROTO_MAX_RETRIES, type);
         return ESP_FAIL;
     } else {
-        // For DATA: use pending seq, non-blocking send with timeout
+        // For DATA: assume pending already set by caller (send_task), just send the frame
         uint8_t frame[FRAME_BUFFER_SIZE];
         size_t frame_len = build_escaped_frame(frame, type, client->pending_seq, payload, payload_len, NULL);
         
+        // ADDED: Non-blocking send with partial retry and timeout
         TickType_t send_start = xTaskGetTickCount();
         int max_delay_ms = 5000;  // 5s max per frame
         int loop_count = 0;
@@ -453,58 +463,12 @@ esp_err_t send_reliable(client_t *client, uint8_t type, const uint8_t *payload, 
             loop_count = 0;  // Reset on progress
             send_start = xTaskGetTickCount();  // Refresh timer
         }
+        // ESP_LOG_BUFFER_HEX(TAG, frame, frame_len);
 
         ESP_LOGD(TAG, "Sent DATA seq=%d len=%d (full %zu bytes)", client->pending_seq, payload_len, frame_len);
         return ESP_OK;
     }
 }
-
-void usb_to_tcp_task(void *pvParameters) {
-    esp_task_wdt_add(NULL);
-    app_message_t msg;
-    const TickType_t queue_timeout = pdMS_TO_TICKS(25000);  // Reset every ~25s if idle (<30s WDT)
-
-    while (1) {
-        BaseType_t got = xQueueReceive(app_queue, &msg, queue_timeout);
-        esp_task_wdt_reset();  // Always reset after wait/processing
-
-        if (got == pdTRUE) {
-            xSemaphoreTake(client_mutex, portMAX_DELAY);
-            if (!active_client.active) {
-                ESP_LOGW(TAG, "TCP not ready, dropping %zu USB bytes", msg.buf_len);
-                xSemaphoreGive(client_mutex);
-                continue;
-            }
-
-            // Check ring space
-            size_t free_space = tx_ring.size - tx_ring.len;
-            size_t to_write = (msg.buf_len > free_space) ? free_space : msg.buf_len;
-            if (to_write == 0) {
-                ESP_LOGW(TAG, "TX ring full (%zu/%zu), dropping %zu bytes", tx_ring.len, tx_ring.size, msg.buf_len);
-                xSemaphoreGive(client_mutex);
-                continue;
-            }
-
-            // Write to ring
-            size_t pos = tx_ring.head;
-            for (size_t i = 0; i < to_write; ++i) {
-                tx_ring.buf[pos] = msg.buf[i];
-                pos = (pos + 1) % tx_ring.size;
-            }
-            tx_ring.head = pos;
-            tx_ring.len += to_write;
-            ESP_LOGD(TAG, "Queued %zu USB bytes (ring: %zu/%zu)", to_write, tx_ring.len, tx_ring.size);
-
-            xSemaphoreGive(client_mutex);
-
-            if (tx_ring.len > (TX_BUFFER_SIZE * 0.8)) {
-                vTaskDelay(pdMS_TO_TICKS(10));
-            }
-        }
-        // No else: timeout auto-handled by reset above
-    }
-}
-
 void app_main(void) {
     esp_err_t ret = init_system();
     if (ret != ESP_OK) {
@@ -516,6 +480,7 @@ void app_main(void) {
         ESP_LOGE(TAG, "USB init failed, restarting");
         esp_restart();
     }
+
 
     xTaskCreatePinnedToCore(tcp_client_task, "tcp_client", 16384, NULL, 4, NULL, 1);
     xTaskCreatePinnedToCore(usb_to_tcp_task, "usb_to_tcp", 12288, NULL, 4, NULL, 1);

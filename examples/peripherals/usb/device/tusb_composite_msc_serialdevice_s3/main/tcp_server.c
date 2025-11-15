@@ -391,11 +391,13 @@ esp_err_t send_control_to_tcp(uint8_t type, const uint8_t *payload, uint16_t pay
     // Append escaped payload
     memcpy(&frame[7], escaped_payload, esc_len);
 
-    // Escape and append CRC (小局部数组，安全)
+    // Escape and append CRC (修复：使用独立缓冲避免溢出)
     uint8_t temp_crc[2] = {(crc >> 8) & 0xFF, crc & 0xFF};
+    uint8_t temp_crc_esc[4];  // 足够大缓冲 (max 4 字节 escaped)
+    memcpy(temp_crc_esc, temp_crc, 2);
     uint16_t crc_esc_len = 2;
-    escape_bytes(temp_crc, &crc_esc_len);
-    memcpy(&frame[7 + esc_len], temp_crc, crc_esc_len);
+    escape_bytes(temp_crc_esc, &crc_esc_len);
+    memcpy(&frame[7 + esc_len], temp_crc_esc, crc_esc_len);
 
     size_t frame_len = 7 + esc_len + crc_esc_len;
 

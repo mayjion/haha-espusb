@@ -71,11 +71,13 @@ size_t build_escaped_frame(uint8_t *frame, uint8_t type, uint16_t seq, const uin
     // Append escaped payload
     memcpy(&frame[7], escaped_payload, esc_len);
 
-    // Escape and append CRC
+    // Escape and append CRC (修复：使用独立缓冲避免溢出)
     uint8_t temp_crc[2] = {(crc >> 8) & 0xFF, crc & 0xFF};
+    uint8_t escaped_crc[4];  // 足够大缓冲 (max 4 字节 escaped)
+    memcpy(escaped_crc, temp_crc, 2);
     uint16_t crc_esc_len = 2;
-    escape_bytes(temp_crc, &crc_esc_len);
-    memcpy(&frame[7 + esc_len], temp_crc, crc_esc_len);
+    escape_bytes(escaped_crc, &crc_esc_len);
+    memcpy(&frame[7 + esc_len], escaped_crc, crc_esc_len);
 
     return 7 + esc_len + crc_esc_len;
 }
