@@ -236,7 +236,7 @@ void parse_and_usb_task(void *pvParameters) {
             frame_parse_status_t status = extract_next_frame(&parse_buf[parsed], avail - parsed, &type, &seq, &pay_len, payload, &crc);
             if (status > 0) {
                 parsed += (size_t)status;
-                ESP_LOGI("usbhandle", "Parsed frame: type=0x%02X seq=%u len=%u crc=0x%04X", type, seq, pay_len, crc);
+                // ESP_LOGI("usbhandle", "Parsed frame: type=0x%02X seq=%u len=%u crc=0x%04X", type, seq, pay_len, crc);
 
                 // Handle types: Output DATA to USB (echo CMD if needed)
                 if (type == PROTO_TYPE_DATA) {

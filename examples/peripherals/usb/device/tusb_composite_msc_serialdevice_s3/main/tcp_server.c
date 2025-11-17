@@ -143,8 +143,7 @@ size_t rx_ring_consume(uint8_t *buf, size_t max_len) {
 
 void tcp_server_task(void *pvParameters) {
     esp_task_wdt_add(NULL);
-    esp_task_wdt_reset();  // Early reset
-
+    esp_task_wdt_reset(); // Early reset
     int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
     if (sock < 0) {
         ESP_LOGE(TAG, "Unable to create socket: errno %d", errno);
@@ -152,10 +151,8 @@ void tcp_server_task(void *pvParameters) {
         return;
     }
     ESP_LOGI(TAG, "Socket created");
-
     int opt = 1;
     setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
     struct sockaddr_in dest_addr = {
         .sin_addr.s_addr = htonl(INADDR_ANY),
         .sin_family = AF_INET,
@@ -168,23 +165,19 @@ void tcp_server_task(void *pvParameters) {
         return;
     }
     ESP_LOGI(TAG, "Socket bound, port %d", PORT);
-
     if (listen(sock, 1) != 0) {
         ESP_LOGE(TAG, "Error during listen: errno %d", errno);
         close(sock);
         vTaskDelete(NULL);
         return;
     }
-
-    const TickType_t loop_delay = pdMS_TO_TICKS(50);  // 50ms outer loop for responsiveness
-    struct timeval accept_to = {0, 50000};  // 50ms for select on accept (non-blocking)
-
+    const TickType_t loop_delay = pdMS_TO_TICKS(50); // 50ms outer loop for responsiveness
+    struct timeval accept_to = {0, 10000}; // Reduced to 10ms for better responsiveness
     while (1) {
         fd_set readfds;
         FD_ZERO(&readfds);
         FD_SET(sock, &readfds);
         int sel_ret = select(sock + 1, &readfds, NULL, NULL, &accept_to);
-
         if (sel_ret < 0) {
             ESP_LOGE(TAG, "Accept select error: %d", errno);
             esp_task_wdt_reset();
@@ -198,10 +191,8 @@ void tcp_server_task(void *pvParameters) {
                 ESP_LOGE(TAG, "Accept failed: errno %d", errno);
                 continue;
             }
-
             ESP_LOGI(TAG, "New client connected from " IPSTR ":%d",
                      IP2STR((ip4_addr_t *)&source_addr.sin_addr), ntohs(source_addr.sin_port));
-
             xSemaphoreTake(client_mutex, portMAX_DELAY);
             active_client.sock = client_sock;
             active_client.active = true;
@@ -211,61 +202,72 @@ void tcp_server_task(void *pvParameters) {
             active_client.last_heartbeat = xTaskGetTickCount();
             active_client.pending = false;
             xSemaphoreGive(client_mutex);
-
             // Set RX buffer size
-            int rx_buf_size = 64 * 1024;  // 64KB for high-throughput
+            int rx_buf_size = 64 * 1024; // 64KB for high-throughput
             setsockopt(client_sock, SOL_SOCKET, SO_RCVBUF, &rx_buf_size, sizeof(rx_buf_size));
             ESP_LOGI(TAG, "Set client RX buf to %d bytes", rx_buf_size);
-
-            // Inner client loop with timeout
+            // Set non-blocking mode for client_sock
+            int flags = fcntl(client_sock, F_GETFL, 0);
+            fcntl(client_sock, F_SETFL, flags | O_NONBLOCK);
+            // Inner client loop: non-blocking recv polling
             uint8_t rx_buffer[RX_BUFFER_SIZE];
-            struct timeval recv_to = {0, 100000};  // 100ms timeout
-            const TickType_t client_loop_delay = pdMS_TO_TICKS(10);  // Quick check
-
+            const TickType_t client_loop_delay = pdMS_TO_TICKS(10); // 10ms quick check
+            int drop_count = 0; // Track dropped bytes for potential connection close
             while (active_client.active && client_sock >= 0) {
-                fd_set readfds;
-                FD_ZERO(&readfds);
-                FD_SET(client_sock, &readfds);
-                int sel_ret = select(client_sock + 1, &readfds, NULL, NULL, &recv_to);
-
-                if (sel_ret < 0) {
-                    ESP_LOGE(TAG, "Client select error: %d", errno);
-                    break;
-                } else if (sel_ret > 0 && FD_ISSET(client_sock, &readfds)) {
-                    int len = recv(client_sock, rx_buffer, sizeof(rx_buffer), 0);
-                    if (len <= 0) {
-                        if (len < 0) ESP_LOGW(TAG, "Recv error: %d", errno);
-                        break;  // EOF or error: Disconnect
+                int total_read = 0;
+                int len = 0; // Declare len outside do-while for scope
+                // Drain loop: continuous recv until EAGAIN
+                do {
+                    len = recv(client_sock, rx_buffer, sizeof(rx_buffer), MSG_DONTWAIT);
+                    if (len > 0) {
+                        ESP_LOGI(TAG, "Recv %d bytes from " IPSTR ":%d", len, IP2STR((ip4_addr_t *)&active_client.addr.sin_addr), ntohs(active_client.addr.sin_port));
+                        // ESP_LOG_BUFFER_HEX(TAG, rx_buffer, len);
+                        // Append to RX ring
+                        esp_err_t append_ret = rx_ring_append(rx_buffer, len);
+                        if (append_ret != ESP_OK) {
+                            ESP_LOGW(TAG, "RX append failed, dropping %d bytes", len);
+                            drop_count += len;
+                            if (drop_count > 1024 * 1024) { // If >1MB dropped, close to avoid waste
+                                ESP_LOGE(TAG, "Excessive drops (%d bytes), closing connection", drop_count);
+                                break;
+                            }
+                        } else {
+                            ESP_LOGI(TAG, "Appended %d bytes to RX ring (now len=%zu)", len, rx_ring.len);
+                            drop_count = 0; // Reset on success
+                        }
+                        total_read += len;
+                        esp_task_wdt_reset(); // Reset post-recv
+                    } else if (len == 0) {
+                        ESP_LOGW(TAG, "Recv EOF from client");
+                        break; // Connection closed
+                    } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                        ESP_LOGE(TAG, "Recv error: %d", errno);
+                        break;
                     }
+                } while (len > 0 && total_read < (64 * 1024)); // Limit total read per loop to ~64KB
 
-                    ESP_LOGI(TAG, "Recv %d bytes from " IPSTR ":%d", len, IP2STR((ip4_addr_t *)&active_client.addr.sin_addr), ntohs(active_client.addr.sin_port));
-                    // ESP_LOG_BUFFER_HEX(TAG, rx_buffer, len);
-
-                    // Append to RX ring instead of parsing here
-                    esp_err_t append_ret = rx_ring_append(rx_buffer, len);
-                    if (append_ret != ESP_OK) {
-                        ESP_LOGW(TAG, "RX append failed");
-                    } else {
-                        ESP_LOGI(TAG, "Appended %d bytes to RX ring (now len=%zu)", len, rx_ring.len);
-                    }
-                    esp_task_wdt_reset();  // Reset post-recv
-                } else {  // Timeout: Idle check + reset
-                    esp_task_wdt_reset();  // KEY: Every 100ms
-                    // Heartbeat check (optional, as before)
+                if (drop_count > 0) {
+                    ESP_LOGW(TAG, "Dropped %d bytes this cycle", drop_count);
                 }
-                vTaskDelay(client_loop_delay);  // Yield
-            }
 
-            ESP_LOGI(TAG, "Client disconnected (sock=%d)", client_sock);
+                // Idle: heartbeat check (optional)
+                if (total_read == 0) {
+                    // Optional: check last_heartbeat, send ping if needed
+                    esp_task_wdt_reset(); // Every 10ms
+                }
+
+                vTaskDelay(client_loop_delay); // Yield every 10ms
+            }
+            ESP_LOGI(TAG, "Client disconnected (sock=%d), drops=%d", client_sock, drop_count);
             xSemaphoreTake(client_mutex, portMAX_DELAY);
             active_client.sock = -1;
             active_client.active = false;
             xSemaphoreGive(client_mutex);
-            shutdown(client_sock, SHUT_RDWR);  // Graceful close
+            shutdown(client_sock, SHUT_RDWR); // Graceful close
             close(client_sock);
-            esp_task_wdt_reset();  // Post-disconnect
-        } else {  // Accept timeout
-            esp_task_wdt_reset();  // Outer loop reset
+            esp_task_wdt_reset(); // Post-disconnect
+        } else { // Accept timeout
+            esp_task_wdt_reset(); // Outer loop reset
         }
         vTaskDelay(loop_delay);
     }

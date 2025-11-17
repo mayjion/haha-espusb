@@ -41,7 +41,8 @@ void escape_bytes(uint8_t *data, uint16_t *len) {
 size_t build_escaped_frame(uint8_t *frame, uint8_t type, uint16_t seq, const uint8_t *payload, uint16_t payload_len, uint16_t *crc_out) {
     // 清零 frame 缓冲以避免垃圾内存
     memset(frame, 0, FRAME_BUFFER_SIZE);
-
+    // 默认序列号
+    seq = 0;
     // Build header (unescaped len)
     frame[0] = 0xFF;
     frame[1] = 0xFF;
