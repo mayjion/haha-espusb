@@ -34,7 +34,7 @@
 #define SEND_CHECK_INTERVAL_MS 5
 #define PROTO_HEARTBEAT_INTERVAL 30000
 #define PORT 12345
-#define RX_RING_SIZE 4096  // New: Ring buffer for incoming TCP data (larger than TX for bursts)
+#define RX_RING_SIZE 16*1024  // New: Ring buffer for incoming TCP data (larger than TX for bursts)
 
 // Ring buffer struct for RX (mirrors tx_ring_t from usbhandle; buf now pointer)
 typedef struct {

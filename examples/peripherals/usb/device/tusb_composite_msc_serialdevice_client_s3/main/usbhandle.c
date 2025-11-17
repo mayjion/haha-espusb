@@ -213,13 +213,43 @@ void usb_to_tcp_task(void *pvParameters) {
         }
     }
 }
+#if 1
+
 void parse_and_usb_task(void *pvParameters) {
     esp_task_wdt_add(NULL);
     uint8_t parse_buf[FRAME_BUFFER_SIZE];
     uint8_t payload[FRAME_BUFFER_SIZE];
     const TickType_t parse_delay = pdMS_TO_TICKS(5);  // 5ms loop for 5ms send interval
+    const int max_retries = 5;  // Increased retries
+    const TickType_t flush_timeout = pdMS_TO_TICKS(100);  // Increased timeout to 100ms per retry
+    static int loop_count = 0;  // For periodic logging
+    const size_t cdc_tx_buf_size = 512;  // Assumed CFG_TUD_CDC_TX_BUFSIZE; adjust if different
+
+    ESP_LOGI("usbhandle", "parse_and_usb_task started");
 
     while (1) {
+        loop_count++;
+        bool is_mounted = tud_mounted();
+        if (loop_count % 200 == 0) {  // Log every ~1s (200 * 5ms)
+            ESP_LOGI("usbhandle", "USB mounted: %s (loop %d)", is_mounted ? "YES" : "NO", loop_count);
+        }
+
+        // Check if USB is mounted (configured) before attempting to consume/forward
+        if (!is_mounted) {
+            ESP_LOGD("usbhandle", "USB not mounted, skipping consume");
+            esp_task_wdt_reset();
+            vTaskDelay(parse_delay);
+            continue;
+        }
+
+        // Optional: Log RX ring status when mounted
+        xSemaphoreTake(rx_mutex, portMAX_DELAY);
+        size_t current_ring_len = rx_ring.len;
+        xSemaphoreGive(rx_mutex);
+        if (loop_count % 40 == 0 && current_ring_len > 0) {  // Log every ~200ms if data pending
+            ESP_LOGI("usbhandle", "USB mounted, RX ring has %zu bytes pending", current_ring_len);
+        }
+
         size_t avail = rx_ring_consume(parse_buf, sizeof(parse_buf));
         if (avail == 0) {
             esp_task_wdt_reset();
@@ -228,7 +258,7 @@ void parse_and_usb_task(void *pvParameters) {
         }
 
         // ADD LOG: Confirm consumption (at INFO level)
-        ESP_LOGI("usbhandle", "Consumed %zu bytes from RX ring for parsing", avail);
+        // ESP_LOGI("usbhandle", "Consumed %zu bytes from RX ring for parsing (total ring was ~%zu)", avail, current_ring_len);
 
         size_t parsed = 0;
         while (parsed < avail) {
@@ -237,25 +267,71 @@ void parse_and_usb_task(void *pvParameters) {
             frame_parse_status_t status = extract_next_frame(&parse_buf[parsed], avail - parsed, &type, &seq, &pay_len, payload, &crc);
             if (status > 0) {
                 parsed += (size_t)status;
-                ESP_LOGI("usbhandle", "Parsed frame: type=0x%02X seq=%u len=%u crc=0x%04X", type, seq, pay_len, crc);
+                // ESP_LOGI("usbhandle", "Parsed frame: type=0x%02X seq=%u len=%u crc=0x%04X", type, seq, pay_len, crc);
 
                 // Handle types: Output DATA to USB (echo CMD if needed)
                 if (type == PROTO_TYPE_DATA) {
                     // Unescape if needed (extract_next_frame already unescapes payload)
                     // ESP_LOG_BUFFER_HEX("usbhandle", payload, pay_len);  // Debug: Raw payload
-                    
-                    // USB output: Queue to CDC ACM
-                    size_t written = tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0, payload, pay_len);
-                    esp_err_t flush_ret_data = ESP_FAIL;
-                    for (int retry = 0; retry < 3; retry++) {
-                        flush_ret_data = tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, pdMS_TO_TICKS(CDC_FLUSH_TIMEOUT_MS));
-                        if (flush_ret_data == ESP_OK && written == pay_len) break;
+
+                    // Chunked USB output: Queue to CDC ACM for large payloads
+                    size_t payload_offset = 0;
+                    size_t total_forwarded = 0;
+                    esp_err_t overall_flush_ret = ESP_OK;
+                    while (payload_offset < pay_len) {
+                        size_t remaining = pay_len - payload_offset;
+                        size_t chunk_size = (remaining > cdc_tx_buf_size) ? cdc_tx_buf_size : remaining;
+
+                        // Queue next chunk
+                        size_t written = tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0, &payload[payload_offset], chunk_size);
+                        ESP_LOGD("usbhandle", "Queued DATA chunk: %zu of %zu bytes (offset %zu, remaining %zu)", written, chunk_size, payload_offset, remaining);
+
+                        if (written == 0) {
+                            ESP_LOGE("usbhandle", "Failed to queue any bytes for DATA chunk at offset %zu; aborting remainder", payload_offset);
+                            overall_flush_ret = ESP_FAIL;
+                            break;
+                        }
+
+                        payload_offset += written;
+                        total_forwarded += written;
+
+                        // Flush the queued chunk
+                        esp_err_t flush_ret = ESP_FAIL;
+                        for (int retry = 0; retry < max_retries; retry++) {
+                            ESP_LOGD("usbhandle", "Flush attempt %d for DATA chunk", retry + 1);
+                            flush_ret = tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, flush_timeout);
+                            if (flush_ret == ESP_OK) {
+                                ESP_LOGD("usbhandle", "Flush successful on attempt %d for DATA chunk", retry + 1);
+                                break;
+                            } else {
+                                ESP_LOGW("usbhandle", "Flush failed on attempt %d: %s", retry + 1, esp_err_to_name(flush_ret));
+                                if (!tud_mounted()) {
+                                    ESP_LOGE("usbhandle", "USB unmounted during flush, aborting DATA chunk");
+                                    flush_ret = ESP_FAIL;
+                                    break;
+                                }
+                            }
+                            vTaskDelay(pdMS_TO_TICKS(10));
+                        }
+
+                        if (flush_ret != ESP_OK) {
+                            ESP_LOGE("usbhandle", "Failed to flush DATA chunk (%zu bytes) at offset %zu after %d retries", written, payload_offset - written, max_retries);
+                            overall_flush_ret = ESP_FAIL;
+                            break;
+                        }
+
+                        // Short delay if large chunk to allow host processing
+                        if (chunk_size >= cdc_tx_buf_size) {
+                            vTaskDelay(pdMS_TO_TICKS(1));  // Minimal yield
+                        }
                     }
 
-                    if (flush_ret_data != ESP_OK || written != pay_len) {
-                        ESP_LOGE(TAG, "Failed to forward %d bytes from client to USB after retries", pay_len);
+                    if (overall_flush_ret != ESP_OK || total_forwarded < pay_len) {
+                        ESP_LOGE("usbhandle", "Partial DATA forward: %zu/%u bytes succeeded; %u dropped due to flush failures", total_forwarded, pay_len, pay_len - total_forwarded);
+                    } else {
+                        ESP_LOGD("usbhandle", "Successfully forwarded full DATA %u bytes to USB in chunks", total_forwarded);
                     }
-                    
+
                     // Optional: Send ACK/RESP back
                     // send_reliable(&active_client, PROTO_TYPE_RESP, payload, pay_len);
                 } else if (type == PROTO_TYPE_CMD) {
@@ -263,11 +339,19 @@ void parse_and_usb_task(void *pvParameters) {
                     ESP_LOGI("usbhandle", "CMD received, len=%u", pay_len);
                 }
             } else if (status == FRAME_INCOMPLETE) {
-                // Partial at end: leave in ring next time (but since consumed, actually drop remainder¡ªacceptable for partial)
-                ESP_LOGD("usbhandle", "Incomplete frame at offset %zu, dropping %zu bytes", parsed, avail - parsed);
-                parsed = avail;  // Advance to drop partial
+                // No full frame found: push back entire unparsed buffer to wait for more data
+                size_t remainder = avail - parsed;
+                if (remainder > 0) {
+                    esp_err_t pushback_ret = rx_ring_append(&parse_buf[parsed], remainder);
+                    if (pushback_ret == ESP_OK) {
+                        ESP_LOGD("usbhandle", "No full frame in %zu bytes, pushed back %zu bytes to RX ring to wait for more", avail - parsed, remainder);
+                    } else {
+                        ESP_LOGW("usbhandle", "No full frame in %zu bytes, failed to push back %zu bytes (ring full?), dropping", avail - parsed, remainder);
+                    }
+                }
+                parsed = avail;  // Exit loop
                 break;
-            } else {  // FRAME_ERROR (though less common now)
+            } else {  // FRAME_ERROR
                 ESP_LOGW("usbhandle", "Parse error at offset %zu, skipping est %u bytes", parsed, pay_len + 9);
                 size_t skip = 7 + pay_len + 2;  // Min header + payload + CRC
                 if (skip > avail - parsed) skip = avail - parsed;
@@ -276,9 +360,131 @@ void parse_and_usb_task(void *pvParameters) {
             }
             esp_task_wdt_reset();
         }
+
+        // After parsing loop, push back any final remainder if applicable (rare now)
+        if (parsed < avail) {
+            size_t remainder = avail - parsed;
+            esp_err_t pushback_ret = rx_ring_append(&parse_buf[parsed], remainder);
+            if (pushback_ret == ESP_OK) {
+                ESP_LOGD("usbhandle", "Pushed back final %zu bytes to RX ring after parsing", remainder);
+            } else {
+                ESP_LOGW("usbhandle", "Failed to push back final %zu bytes (ring full?), dropping", remainder);
+            }
+        }
+
         esp_task_wdt_reset();
         vTaskDelay(parse_delay);
     }
 }
 
+#else
+
+void parse_and_usb_task(void *pvParameters) {
+    esp_task_wdt_add(NULL);
+    uint8_t parse_buf[FRAME_BUFFER_SIZE];
+    const TickType_t parse_delay = pdMS_TO_TICKS(5);  // 5ms loop for 5ms send interval
+    const int max_retries = 5;  // Increased retries
+    const TickType_t flush_timeout = pdMS_TO_TICKS(100);  // Increased timeout to 100ms per retry
+    static int loop_count = 0;  // For periodic logging
+    const size_t cdc_tx_buf_size = 512;  // Assumed CFG_TUD_CDC_TX_BUFSIZE; adjust if different
+
+    ESP_LOGI("usbhandle", "parse_and_usb_task started");
+
+    while (1) {
+        loop_count++;
+        bool is_mounted = tud_mounted();
+        if (loop_count % 200 == 0) {  // Log every ~1s (200 * 5ms)
+            ESP_LOGI("usbhandle", "USB mounted: %s (loop %d)", is_mounted ? "YES" : "NO", loop_count);
+        }
+
+        // Check if USB is mounted (configured) before attempting to consume/forward
+        if (!is_mounted) {
+            ESP_LOGD("usbhandle", "USB not mounted, skipping consume");
+            esp_task_wdt_reset();
+            vTaskDelay(parse_delay);
+            continue;
+        }
+
+        // Optional: Log RX ring status when mounted
+        xSemaphoreTake(rx_mutex, portMAX_DELAY);
+        size_t current_ring_len = rx_ring.len;
+        xSemaphoreGive(rx_mutex);
+        if (loop_count % 40 == 0 && current_ring_len > 0) {  // Log every ~200ms if data pending
+            ESP_LOGI("usbhandle", "USB mounted, RX ring has %zu bytes pending", current_ring_len);
+        }
+
+        size_t avail = rx_ring_consume(parse_buf, sizeof(parse_buf));
+        if (avail == 0) {
+            esp_task_wdt_reset();
+            vTaskDelay(parse_delay);
+            continue;
+        }
+
+        // ADD LOG: Confirm consumption (at INFO level)
+        ESP_LOGI("usbhandle", "Consumed %zu bytes from RX ring for forwarding (total ring was ~%zu)", avail, current_ring_len);
+
+        // Chunked forwarding to handle limited CDC TX buffer
+        size_t offset = 0;
+        size_t total_forwarded = 0;
+        esp_err_t overall_flush_ret = ESP_OK;
+        while (offset < avail) {
+            size_t remaining = avail - offset;
+            size_t chunk_size = (remaining > cdc_tx_buf_size) ? cdc_tx_buf_size : remaining;
+
+            // Queue next chunk
+            size_t written = tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0, &parse_buf[offset], chunk_size);
+            ESP_LOGI("usbhandle", "Queued chunk: %zu of %zu bytes (offset %zu, remaining %zu)", written, chunk_size, offset, remaining);
+
+            if (written == 0) {
+                ESP_LOGE("usbhandle", "Failed to queue any bytes for chunk at offset %zu; aborting remainder", offset);
+                overall_flush_ret = ESP_FAIL;
+                break;
+            }
+
+            offset += written;
+            total_forwarded += written;
+
+            // Flush the queued chunk
+            esp_err_t flush_ret = ESP_FAIL;
+            for (int retry = 0; retry < max_retries; retry++) {
+                ESP_LOGD("usbhandle", "Flush attempt %d for chunk", retry + 1);
+                flush_ret = tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, flush_timeout);
+                if (flush_ret == ESP_OK) {
+                    ESP_LOGD("usbhandle", "Flush successful on attempt %d for chunk", retry + 1);
+                    break;
+                } else {
+                    ESP_LOGW("usbhandle", "Flush failed on attempt %d: %s", retry + 1, esp_err_to_name(flush_ret));
+                    if (!tud_mounted()) {
+                        ESP_LOGE("usbhandle", "USB unmounted during flush, aborting chunk");
+                        flush_ret = ESP_FAIL;
+                        break;
+                    }
+                }
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
+
+            if (flush_ret != ESP_OK) {
+                ESP_LOGE("usbhandle", "Failed to flush chunk (%zu bytes) at offset %zu after %d retries", written, offset - written, max_retries);
+                overall_flush_ret = ESP_FAIL;
+                // Continue to try next chunks? Or break; for now, break to avoid partial sends
+                break;
+            }
+
+            // Short delay if large chunk to allow host processing
+            if (chunk_size >= cdc_tx_buf_size) {
+                vTaskDelay(pdMS_TO_TICKS(1));  // Minimal yield
+            }
+        }
+
+        if (overall_flush_ret != ESP_OK || total_forwarded < avail) {
+            ESP_LOGE("usbhandle", "Partial forward: %zu/%zu bytes succeeded; %zu dropped due to flush failures", total_forwarded, avail, avail - total_forwarded);
+        } else {
+            ESP_LOGD("usbhandle", "Successfully forwarded full %zu bytes to USB in chunks", total_forwarded);
+        }
+
+        esp_task_wdt_reset();
+        vTaskDelay(parse_delay);
+    }
+}
+#endif
 

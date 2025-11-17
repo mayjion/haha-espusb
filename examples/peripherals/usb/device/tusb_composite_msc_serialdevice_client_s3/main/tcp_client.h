@@ -35,7 +35,7 @@
 #define PROTO_HEARTBEAT_INTERVAL 30000
 #define PORT 12345
 #define SERVER_IP "192.168.4.1"  // Default AP IP for server
-#define RX_RING_SIZE 4096  // Ring buffer for incoming TCP data (larger than TX for bursts)
+#define RX_RING_SIZE 16*1024  // Ring buffer for incoming TCP data (larger than TX for bursts)
 
 // Ring buffer struct for RX (mirrors tx_ring_t from usbhandle; buf now pointer)
 typedef struct {
