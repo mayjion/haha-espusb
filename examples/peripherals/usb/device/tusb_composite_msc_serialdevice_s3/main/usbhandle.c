@@ -232,11 +232,7 @@ void parse_and_usb_task(void *pvParameters) {
     ESP_LOGI("usbhandle", "parse_and_usb_task started");
 
     while (1) {
-        loop_count++;
         bool is_mounted = tud_mounted();
-        if (loop_count % 200 == 0) {  // Log every ~1s (200 * 5ms)
-            ESP_LOGI("usbhandle", "USB mounted: %s (loop %d)", is_mounted ? "YES" : "NO", loop_count);
-        }
 
         // Check if USB is mounted (configured) before attempting to consume/forward
         if (!is_mounted) {
@@ -250,9 +246,6 @@ void parse_and_usb_task(void *pvParameters) {
         xSemaphoreTake(rx_mutex, portMAX_DELAY);
         size_t current_ring_len = rx_ring.len;
         xSemaphoreGive(rx_mutex);
-        if (loop_count % 40 == 0 && current_ring_len > 0) {  // Log every ~200ms if data pending
-            ESP_LOGI("usbhandle", "USB mounted, RX ring has %zu bytes pending", current_ring_len);
-        }
 
         size_t avail = rx_ring_consume(parse_buf, sizeof(parse_buf));
         if (avail == 0) {

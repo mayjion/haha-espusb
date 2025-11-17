@@ -57,8 +57,8 @@ void tinyusb_cdc_line_coding_changed_callback(int itf, cdcacm_event_t *event) {
              coding->p_line_coding->parity, coding->p_line_coding->data_bits);
     ESP_LOGI(TAG, "Baud rate update: %s", message);
 
-    // 发送格式化协议帧（type=CMD）
-    send_control_to_tcp(PROTO_TYPE_CMD, (const uint8_t *)message, msg_len);  // 注意：snprintf 返回长度，不含 \0
+
+    send_control_to_tcp(PROTO_TYPE_CMD, (const uint8_t *)message, msg_len);  
 }
 
 static uint32_t total_received = 0;
@@ -83,14 +83,14 @@ void tinyusb_cdc_rx_callback(int itf, cdcacm_event_t *event) {
 
         total_received += rx_size;
         if (total_received % 5000 == 0) ESP_LOGI(TAG, "Total USB received: %u bytes", total_received);
-        // 入队
+
         if (xQueueSend(app_queue, &msg, 0) != pdTRUE) {
             ESP_LOGW(TAG, "app_queue full: dropped %zu RX bytes", rx_size);
         } else {
-            // ADDED: Notify usb_to_tcp_task (从 ISR 安全)
-            TaskHandle_t usb_task_handle = NULL;  // 静态或全局获取
+            // ADDED: Notify usb_to_tcp_task 
+            TaskHandle_t usb_task_handle = NULL; 
             if (usb_task_handle == NULL) {
-                usb_task_handle = xTaskGetHandle("usb_to_tcp");  // 任务名匹配 xTaskCreate
+                usb_task_handle = xTaskGetHandle("usb_to_tcp"); 
             }
             BaseType_t higher_priority = pdFALSE;
             vTaskNotifyGiveFromISR(usb_task_handle, &higher_priority);
@@ -157,7 +157,7 @@ void usb_to_tcp_task(void *pvParameters) {
             while (xQueueReceive(app_queue, &msg, 0) == pdTRUE) {  // Drain all pending (non-blocking)
                 if (msg.buf_len > 0) {
                     ESP_LOGI(TAG, "USB RX: %u bytes", msg.buf_len);
-                    // ESP_LOG_BUFFER_HEX(TAG, msg.buf, msg.buf_len);  // ADDED: Dump USB raw 数据确认 (before lock)
+                    // ESP_LOG_BUFFER_HEX(TAG, msg.buf, msg.buf_len);  // ADDED: Dump USB raw(before lock)
                     // Defensive: Zero tail of msg.buf to prevent queue garbage propagation
                     memset(msg.buf + msg.buf_len, 0, sizeof(msg.buf) - msg.buf_len);
                 }
@@ -190,13 +190,13 @@ void usb_to_tcp_task(void *pvParameters) {
                     size_t pos = tx_ring.head;
                     for (size_t i = 0; i < to_write; ++i) {
                         tx_ring.buf[pos] = msg.buf[i];
-                        pos = (pos + 1) % tx_ring.size;  // 修改：使用 tx_ring.size
+                        pos = (pos + 1) % tx_ring.size;  
                     }
                     tx_ring.head = pos;
                     tx_ring.len += to_write;
                     ESP_LOGD(TAG, "Queued %zu USB bytes (ring: %zu/%zu)", to_write, tx_ring.len, tx_ring.size);
 
-                    // 添加：写后验证（无环绕时）
+                  
                     if (tx_ring.tail == 0 && to_write >= 3) {
                         ESP_LOGI(TAG, "Ring write check: buf[0]=0x%02X, buf[1]=0x%02X, buf[2]=0x%02X", 
                                  tx_ring.buf[0], tx_ring.buf[1], tx_ring.buf[2]);
@@ -228,11 +228,7 @@ void parse_and_usb_task(void *pvParameters) {
     ESP_LOGI("usbhandle", "parse_and_usb_task started");
 
     while (1) {
-        loop_count++;
         bool is_mounted = tud_mounted();
-        if (loop_count % 200 == 0) {  // Log every ~1s (200 * 5ms)
-            ESP_LOGI("usbhandle", "USB mounted: %s (loop %d)", is_mounted ? "YES" : "NO", loop_count);
-        }
 
         // Check if USB is mounted (configured) before attempting to consume/forward
         if (!is_mounted) {
@@ -246,9 +242,6 @@ void parse_and_usb_task(void *pvParameters) {
         xSemaphoreTake(rx_mutex, portMAX_DELAY);
         size_t current_ring_len = rx_ring.len;
         xSemaphoreGive(rx_mutex);
-        if (loop_count % 40 == 0 && current_ring_len > 0) {  // Log every ~200ms if data pending
-            ESP_LOGI("usbhandle", "USB mounted, RX ring has %zu bytes pending", current_ring_len);
-        }
 
         size_t avail = rx_ring_consume(parse_buf, sizeof(parse_buf));
         if (avail == 0) {
@@ -269,7 +262,7 @@ void parse_and_usb_task(void *pvParameters) {
                 parsed += (size_t)status;
                 // ESP_LOGI("usbhandle", "Parsed frame: type=0x%02X seq=%u len=%u crc=0x%04X", type, seq, pay_len, crc);
 
-                // Handle types: Output DATA to USB (echo CMD if needed)
+                // Handle types: Output DATA to USB (handle CMD for WIFI config)
                 if (type == PROTO_TYPE_DATA) {
                     // Unescape if needed (extract_next_frame already unescapes payload)
                     // ESP_LOG_BUFFER_HEX("usbhandle", payload, pay_len);  // Debug: Raw payload
@@ -335,8 +328,42 @@ void parse_and_usb_task(void *pvParameters) {
                     // Optional: Send ACK/RESP back
                     // send_reliable(&active_client, PROTO_TYPE_RESP, payload, pay_len);
                 } else if (type == PROTO_TYPE_CMD) {
-                    // Process command (placeholder)
+                    // Handle WIFI credentials command
                     ESP_LOGI("usbhandle", "CMD received, len=%u", pay_len);
+                    if (pay_len > 5 && memcmp(payload, "WIFI=", 5) == 0) {
+                        char *comma_pos = (char *)memchr(&payload[5], ',', pay_len - 5);
+                        if (comma_pos != NULL) {
+                            size_t ssid_len = comma_pos - (char *)&payload[5];
+                            size_t pass_start = (size_t)(comma_pos - (char *)payload) + 1;
+                            size_t pass_len = pay_len - pass_start - 2;  // Skip \r\n
+                            if (ssid_len < 32 && pass_len < 64 && pass_len > 0) {
+                                char ssid[32] = {0};
+                                char password[64] = {0};
+                                memcpy(ssid, &payload[5], ssid_len);
+                                memcpy(password, &payload[pass_start], pass_len);
+                                esp_err_t save_ret = save_wifi_credentials(ssid, password);
+                                if (save_ret == ESP_OK) {
+                                    ESP_LOGI("usbhandle", "WiFi credentials received and saved: SSID=%s", ssid);
+                                    // Optional: Forward a notification to USB host
+                                    char notify[128];
+                                    size_t notify_len = snprintf(notify, sizeof(notify), "WIFI_CONFIGURED=%s\r\n", ssid);
+                                    size_t written = tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0, (uint8_t*)notify, notify_len);
+                                    tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, flush_timeout);
+                                    vTaskDelay(pdMS_TO_TICKS(2000));  // Delay for host to read
+                                    esp_restart();  // Restart to connect to new WiFi
+                                } else {
+                                    ESP_LOGE("usbhandle", "Failed to save WiFi credentials: %s", esp_err_to_name(save_ret));
+                                }
+                            } else {
+                                ESP_LOGW("usbhandle", "Invalid WiFi payload lengths: ssid=%zu, pass=%zu", ssid_len, pass_len);
+                            }
+                        } else {
+                            ESP_LOGW("usbhandle", "No comma in WiFi payload");
+                        }
+                    } else {
+                        ESP_LOGD("usbhandle", "Unhandled CMD payload (len=%u)", pay_len);
+                    }
+                    // Do NOT forward CMD to USB
                 }
             } else if (status == FRAME_INCOMPLETE) {
                 // No full frame found: push back entire unparsed buffer to wait for more data
@@ -377,8 +404,8 @@ void parse_and_usb_task(void *pvParameters) {
     }
 }
 
-#else
-
+#endif
+#if 0
 void parse_and_usb_task(void *pvParameters) {
     esp_task_wdt_add(NULL);
     uint8_t parse_buf[FRAME_BUFFER_SIZE];

@@ -81,61 +81,75 @@ void button_task(void *pvParameters) {
                 press_start = xTaskGetTickCount();
                 pressed = true;
                 ESP_LOGD(TAG, "Button pressed");
-            } else if (pressed && !current_state) {  // Release
-                TickType_t duration = xTaskGetTickCount() - press_start;
-                uint32_t ms_duration = pdTICKS_TO_MS(duration);
-                ESP_LOGI(TAG, "Button release detected (%ums)", ms_duration);
-                if (ms_duration < BUTTON_CLICK_THRESHOLD_MS) {
-                    // Modified: Check for client active and factory state before WiFi config send
-                    bool client_active = false;
-                    xSemaphoreTake(client_mutex, pdMS_TO_TICKS(100));
-                    client_active = active_client.active;
-                    xSemaphoreGive(client_mutex);
-                    if (factory_state && client_active) {
-                        uint8_t mac[6];
-                        char new_ssid[32];
-                        char new_password[64];
-                        char mac_str[13];
-                        esp_err_t mac_ret = esp_wifi_get_mac(WIFI_IF_AP, mac);
-                        if (mac_ret != ESP_OK) {
-                            ESP_LOGE(TAG, "Failed to get MAC: %s", esp_err_to_name(mac_ret));
-                        } else {
-                            snprintf(mac_str, sizeof(mac_str), "%02X%02X%02X%02X%02X%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-                            snprintf(new_ssid, sizeof(new_ssid), "FUNLIGHT-%s", &mac_str[8]);
-                            snprintf(new_password, sizeof(new_password), "funlight-%s", &mac_str[8]);
-                            char message[128];
-                            size_t msg_len = snprintf(message, sizeof(message), "WIFI=%s,%s\r\n", new_ssid, new_password);
-                            esp_err_t send_ret = send_control_to_tcp(PROTO_TYPE_CMD, (const uint8_t *)message, msg_len);
-                            if (send_ret == ESP_OK) {
-                                ESP_LOGI(TAG, "Sent WiFi credentials to client: %s", message);
-                                vTaskDelay(pdMS_TO_TICKS(2000));  // Ensure client receives notification
-                                esp_err_t save_ret = save_wifi_credentials(new_ssid, new_password);  // Assumes function exists in wificonfig
-                                if (save_ret == ESP_OK) {
-                                    update_wifi_config(new_ssid, new_password);  // Assumes function exists in wificonfig
-                                    factory_state = false;
-                                    ESP_LOGI(TAG, "WiFi credentials updated, restarting");
-                                    vTaskDelay(pdMS_TO_TICKS(1000));
-                                    esp_restart();
-                                } else {
-                                    ESP_LOGE(TAG, "Failed to save WiFi credentials: %s", esp_err_to_name(save_ret));
-                                }
+
+                // Wait for release or long press timeout
+                BaseType_t release_notified = xTaskNotifyWait(0, 0, NULL, pdMS_TO_TICKS(BUTTON_LONG_PRESS_MS));
+                TickType_t now = xTaskGetTickCount();
+                uint32_t ms_duration = pdTICKS_TO_MS(now - press_start);
+                bool still_pressed = !gpio_get_level(BUTTON_GPIO);
+
+                if (release_notified == pdTRUE || !still_pressed) {
+                    // Release detected (early or late)
+                    ESP_LOGI(TAG, "Button release detected (%ums)", ms_duration);
+                    if (ms_duration < BUTTON_CLICK_THRESHOLD_MS) {
+                        // Modified: Check for client active and factory state before WiFi config send
+                        bool client_active = false;
+                        xSemaphoreTake(client_mutex, pdMS_TO_TICKS(100));
+                        client_active = active_client.active;
+                        xSemaphoreGive(client_mutex);
+                        if (factory_state && client_active) {
+                            uint8_t mac[6];
+                            char new_ssid[32];
+                            char new_password[64];
+                            char mac_str[13];
+                            esp_err_t mac_ret = esp_wifi_get_mac(WIFI_IF_AP, mac);
+                            if (mac_ret != ESP_OK) {
+                                ESP_LOGE(TAG, "Failed to get MAC: %s", esp_err_to_name(mac_ret));
                             } else {
-                                ESP_LOGE(TAG, "Failed to send WiFi credentials to client: %s", esp_err_to_name(send_ret));
+                                snprintf(mac_str, sizeof(mac_str), "%02X%02X%02X%02X%02X%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+                                snprintf(new_ssid, sizeof(new_ssid), "FUNLIGHT-%s", &mac_str[8]);
+                                snprintf(new_password, sizeof(new_password), "funlight-%s", &mac_str[8]);
+                                char message[128];
+                                size_t msg_len = snprintf(message, sizeof(message), "WIFI=%s,%s\r\n", new_ssid, new_password);
+                                esp_err_t send_ret = send_control_to_tcp(PROTO_TYPE_CMD, (const uint8_t *)message, msg_len);
+                                if (send_ret == ESP_OK) {
+                                    ESP_LOGI(TAG, "Sent WiFi credentials to client: %s", message);
+                                    vTaskDelay(pdMS_TO_TICKS(2000));  // Ensure client receives notification
+                                    esp_err_t save_ret = save_wifi_credentials(new_ssid, new_password);  // Assumes function exists in wificonfig
+                                    if (save_ret == ESP_OK) {
+                                        update_wifi_config(new_ssid, new_password);  // Assumes function exists in wificonfig
+                                        factory_state = false;
+                                        ESP_LOGI(TAG, "WiFi credentials updated, restarting");
+                                        vTaskDelay(pdMS_TO_TICKS(1000));
+                                        esp_restart();
+                                    } else {
+                                        ESP_LOGE(TAG, "Failed to save WiFi credentials: %s", esp_err_to_name(save_ret));
+                                    }
+                                } else {
+                                    ESP_LOGE(TAG, "Failed to send WiFi credentials to client: %s", esp_err_to_name(send_ret));
+                                }
                             }
+                        } else {
+                            // Fallback: Original LED event if not factory or no client
+                            xEventGroupSetBits(led_event_group, LED_EVENT_ACTIVE_BIT);
+                            ESP_LOGI(TAG, "Button short click detected (%ums) - LED event set", ms_duration);
                         }
-                    } else {
-                        // Fallback: Original LED event if not factory or no client
-                        xEventGroupSetBits(led_event_group, LED_EVENT_ACTIVE_BIT);
-                        ESP_LOGI(TAG, "Button short click detected (%ums) - LED event set", ms_duration);
+                    } else if (ms_duration >= BUTTON_LONG_PRESS_MS) {
+                        ESP_LOGW(TAG, "Button long press detected on release (%ums) - resetting", ms_duration);
+                        wifi_clear_config();
+                        esp_restart();
                     }
-                } else if (ms_duration >= BUTTON_LONG_PRESS_MS) {  // >= for edge case
+                    // Medium press: do nothing
+                    pressed = false;
+                } else {
+                    // Timeout and still pressed: long press without release
                     ESP_LOGW(TAG, "Button long press detected (%ums) - resetting", ms_duration);
                     wifi_clear_config();
                     esp_restart();
                 }
-                pressed = false;
             }
-            vTaskDelay(pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS));  // Debounce
+            // Removed: else if (pressed && !current_state) branch, as release is now handled in inner wait
+            vTaskDelay(pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS));  // Debounce after handling
         }
         // No else: Timeout just resets WDT, loop continues
     }

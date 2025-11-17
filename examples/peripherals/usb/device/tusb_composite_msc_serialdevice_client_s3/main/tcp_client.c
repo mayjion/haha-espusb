@@ -60,7 +60,7 @@ esp_err_t init_system(void) {
         ESP_LOGE(TAG, "Failed to create client_mutex");
         return ESP_FAIL;
     }
-    ESP_LOGI(TAG, "client_mutex created OK");  // 添加：确认创建成功
+    ESP_LOGI(TAG, "client_mutex created OK"); 
     // Ring buffer init: Dynamic heap alloc to avoid .bss issues
     // TX ring
     tx_ring.buf = calloc(TX_BUFFER_SIZE, sizeof(uint8_t));  // Alloc + zero
@@ -279,16 +279,16 @@ void send_task(void *pvParameters) {
         // Fixed copy loop: Use for loop for exact chunk_size bytes
         size_t pos = tx_ring.tail;
         uint8_t temp_payload[MAX_TX_SIZE];
-        memset(temp_payload, 0, sizeof(temp_payload));  // 必须添加：清除栈垃圾
-        // ESP_LOGI(TAG, "Starting copy loop: chunk_size=%zu", chunk_size);  // 调试：确认 chunk_size
+        memset(temp_payload, 0, sizeof(temp_payload)); 
+        // ESP_LOGI(TAG, "Starting copy loop: chunk_size=%zu", chunk_size);  
         for (size_t i = 0; i < chunk_size; ++i) {
             temp_payload[i] = tx_ring.buf[pos];
-            pos = (pos + 1) % tx_ring.size;  // 修改：使用 tx_ring.size 而非 TX_BUFFER_SIZE（一致性）
-            // if (i < 5) {  // 调试：只日志前5个迭代，确认循环执行
+            pos = (pos + 1) % tx_ring.size; 
+    
             //     ESP_LOGI(TAG, "Copy i=%zu: temp[%zu]=0x%02X from buf[%zu]=0x%02X", i, i, temp_payload[i], (tx_ring.tail + i) % tx_ring.size, tx_ring.buf[(tx_ring.tail + i) % tx_ring.size]);
             // }
         }
-        // ESP_LOGI(TAG, "Copy loop complete: final pos=%zu", pos);  // 调试：确认循环结束
+        // ESP_LOGI(TAG, "Copy loop complete: final pos=%zu", pos); 
         size_t copied = chunk_size;
         ESP_LOGI(TAG, "TCP TX: %u bytes", copied);
         // ESP_LOG_BUFFER_HEX(TAG, temp_payload, copied);  
@@ -326,7 +326,6 @@ esp_err_t send_control_to_tcp(uint8_t type, const uint8_t *payload, uint16_t pay
         return ESP_FAIL;
     }
 
-    // 堆分配缓冲：frame (总帧), escaped_payload (转义后负载), crc_data (CRC 计算用)
     uint8_t *frame = malloc(FRAME_BUFFER_SIZE);  // ~2.3KB
     uint8_t *escaped_payload = malloc(MAX_TX_SIZE * 2);  // ~2KB
     uint8_t *crc_data = malloc(5 + MAX_TX_SIZE);  // ~1KB
@@ -339,7 +338,6 @@ esp_err_t send_control_to_tcp(uint8_t type, const uint8_t *payload, uint16_t pay
         return ESP_FAIL;
     }
 
-    // 清零缓冲
     memset(frame, 0, FRAME_BUFFER_SIZE);
     memset(escaped_payload, 0, MAX_TX_SIZE * 2);
     memset(crc_data, 0, 5 + MAX_TX_SIZE);
@@ -371,9 +369,8 @@ esp_err_t send_control_to_tcp(uint8_t type, const uint8_t *payload, uint16_t pay
     // Append escaped payload
     memcpy(&frame[7], escaped_payload, esc_len);
 
-    // Escape and append CRC (修复：使用独立缓冲避免溢出)
     uint8_t temp_crc[2] = {(crc >> 8) & 0xFF, crc & 0xFF};
-    uint8_t temp_crc_esc[4];  // 足够大缓冲 (max 4 字节 escaped)
+    uint8_t temp_crc_esc[4]; 
     memcpy(temp_crc_esc, temp_crc, 2);
     uint16_t crc_esc_len = 2;
     escape_bytes(temp_crc_esc, &crc_esc_len);
@@ -381,11 +378,11 @@ esp_err_t send_control_to_tcp(uint8_t type, const uint8_t *payload, uint16_t pay
 
     size_t frame_len = 7 + esc_len + crc_esc_len;
 
-    // 日志：确认构建
+
     ESP_LOGI(TAG, "Built control frame: type=0x%02X, seq=%u, payload_len=%u, crc=0x%04X, total_frame=%zu bytes", 
              type, seq, payload_len, crc, frame_len);
 
-    // 发送（带重试）
+
     esp_err_t ret = ESP_FAIL;
     for (int retry = 0; retry < PROTO_MAX_RETRIES; retry++) {
         int sent = send(active_client.sock, frame, frame_len, 0);
@@ -398,7 +395,6 @@ esp_err_t send_control_to_tcp(uint8_t type, const uint8_t *payload, uint16_t pay
         vTaskDelay(pdMS_TO_TICKS(PROTO_TIMEOUT_MS * (retry + 1)));
     }
 
-    // 释放堆缓冲
     free(frame);
     free(escaped_payload);
     free(crc_data);

@@ -60,7 +60,6 @@ void button_init(void) {
     ESP_LOGI(TAG, "Button GPIO initialized with interrupts");
 }
 
-
 void button_task(void *pvParameters) {
     button_task_handle = xTaskGetCurrentTaskHandle();
     esp_task_wdt_add(NULL);
@@ -81,25 +80,47 @@ void button_task(void *pvParameters) {
                 press_start = xTaskGetTickCount();
                 pressed = true;
                 ESP_LOGD(TAG, "Button pressed");
-            } else if (pressed && !current_state) {  // Release
-                TickType_t duration = xTaskGetTickCount() - press_start;
-                uint32_t ms_duration = pdTICKS_TO_MS(duration);
-                ESP_LOGI(TAG, "Button release detected (%ums)", ms_duration);
-                if (ms_duration < BUTTON_CLICK_THRESHOLD_MS) {
-                    // Client: Short click does nothing (no WiFi config send)
-                    ESP_LOGI(TAG, "Button short click detected (%ums) - no action", ms_duration);
-                } else if (ms_duration >= BUTTON_LONG_PRESS_MS) {  // >= for edge case
-                    ESP_LOGW(TAG, "Button long press detected (%ums) - factory reset", ms_duration);
+
+                // Wait for release or long press timeout
+                BaseType_t release_notified = xTaskNotifyWait(0, 0, NULL, pdMS_TO_TICKS(BUTTON_LONG_PRESS_MS));
+                TickType_t now = xTaskGetTickCount();
+                uint32_t ms_duration = pdTICKS_TO_MS(now - press_start);
+                bool still_pressed = !gpio_get_level(BUTTON_GPIO);
+
+                if (release_notified == pdTRUE || !still_pressed) {
+                    // Release detected (early or late)
+                    ESP_LOGI(TAG, "Button release detected (%ums)", ms_duration);
+                    if (ms_duration < BUTTON_CLICK_THRESHOLD_MS) {
+                        // Modified: Check for client active and factory state before WiFi config send
+                        bool client_active = false;
+                        xSemaphoreTake(client_mutex, pdMS_TO_TICKS(100));
+                        client_active = active_client.active;
+                        xSemaphoreGive(client_mutex);
+                        // Fallback: Original LED event if not factory or no client
+                        xEventGroupSetBits(led_event_group, LED_EVENT_ACTIVE_BIT);
+                        ESP_LOGI(TAG, "Button short click detected (%ums) - LED event set", ms_duration);
+                  
+                    } else if (ms_duration >= BUTTON_LONG_PRESS_MS) {
+                        ESP_LOGW(TAG, "Button long press detected on release (%ums) - resetting", ms_duration);
+                        wifi_clear_config();
+                        esp_restart();
+                    }
+                    // Medium press: do nothing
+                    pressed = false;
+                } else {
+                    // Timeout and still pressed: long press without release
+                    ESP_LOGW(TAG, "Button long press detected (%ums) - resetting", ms_duration);
                     wifi_clear_config();
                     esp_restart();
                 }
-                pressed = false;
             }
-            vTaskDelay(pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS));  // Debounce
+            // Removed: else if (pressed && !current_state) branch, as release is now handled in inner wait
+            vTaskDelay(pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS));  // Debounce after handling
         }
         // No else: Timeout just resets WDT, loop continues
     }
 }
+
 
 EventGroupHandle_t get_led_event_group(void) {
     if (led_event_group == NULL) {
