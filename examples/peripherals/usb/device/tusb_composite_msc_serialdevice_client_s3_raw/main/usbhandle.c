@@ -1,5 +1,6 @@
 #include "usbhandle.h"
-#include "tcp_server.h"  // For shared tx_ring, app_queue, TAG
+#include "tcp_client.h"  // For shared tx_ring, app_queue, TAG
+
 
 // Device descriptor
 static const tusb_desc_device_t desc_device = {
@@ -11,7 +12,7 @@ static const tusb_desc_device_t desc_device = {
     .bDeviceProtocol = MISC_PROTOCOL_IAD,
     .bMaxPacketSize0 = CFG_TUD_ENDPOINT0_SIZE,
     .idVendor = 0xCafe,
-    .idProduct = 0x4000,
+    .idProduct = 0x4001,  // Different product ID for client
     .bcdDevice = 0x0100,
     .iManufacturer = 0x01,
     .iProduct = 0x02,
@@ -29,8 +30,8 @@ static const uint8_t desc_configuration[] = {
 static const char *string_desc_arr[] = {
     (const char[]){0x09, 0x04}, // Language: English (US)
     "Manufacturer",
-    "ESP32-S3 CDC Device",
-    "1234567890",
+    "ESP32-S3 CDC Client",  // Updated product string
+    "1234567891",  // Different serial
     "CDC Interface"
 };
 
@@ -217,6 +218,8 @@ void usb_to_tcp_task(void *pvParameters) {
     }
 }
 
+
+
 void parse_and_usb_task(void *pvParameters) {
     esp_task_wdt_add(NULL);
     uint8_t parse_buf[FRAME_BUFFER_SIZE];
@@ -244,7 +247,6 @@ void parse_and_usb_task(void *pvParameters) {
         size_t current_ring_len = rx_ring.len;
         xSemaphoreGive(rx_mutex);
 
-
         size_t avail = rx_ring_consume(parse_buf, sizeof(parse_buf));
         if (avail == 0) {
             esp_task_wdt_reset();
@@ -255,7 +257,78 @@ void parse_and_usb_task(void *pvParameters) {
         // ADD LOG: Confirm consumption (at INFO level)
         // ESP_LOGI("usbhandle", "Consumed %zu bytes from RX ring for forwarding (total ring was ~%zu)", avail, current_ring_len);
 
-        // Chunked forwarding to handle limited CDC TX buffer
+        // NEW: Check if this is a WiFi config message starting with "WIFI="
+        if (avail >= 5 && strncmp((const char*)parse_buf, "WIFI=", 5) == 0) {
+            ESP_LOGI("usbhandle", "Detected WiFi config message (%zu bytes)", avail);
+
+            // Parse "WIFI=SSID,PASS" format
+            const char* comma_pos = strchr((const char*)parse_buf + 5, ',');
+            if (comma_pos != NULL) {
+                size_t ssid_len = comma_pos - ((const char*)parse_buf + 5);
+                size_t pass_start = (size_t)(comma_pos - (const char*)parse_buf) + 1;
+                size_t pass_len = avail - pass_start;  // Assume message ends at buffer end
+
+                // Validate lengths: SSID <= 31 bytes, PASS <= 63 bytes (ESP WiFi limits)
+                if (ssid_len > 0 && ssid_len <= 31 && pass_len > 0 && pass_len <= 63) {
+                    char ssid[32] = {0};
+                    char password[64] = {0};
+                    memcpy(ssid, parse_buf + 5, ssid_len);
+                    ssid[ssid_len] = '\0';  // Null-terminate
+
+                    memcpy(password, parse_buf + pass_start, pass_len);
+                    password[pass_len] = '\0';  // Null-terminate
+
+                    // Trim trailing \r\n if present
+                    size_t trim_len = pass_len;
+                    while (trim_len > 0 && (password[trim_len - 1] == '\n' || password[trim_len - 1] == '\r')) {
+                        trim_len--;
+                    }
+                    password[trim_len] = '\0';
+                    pass_len = trim_len;
+
+                    ESP_LOGI("usbhandle", "Parsed WiFi config: SSID='%s' (len=%zu), PASS='%s' (len=%zu)", ssid, ssid_len, password, pass_len);
+
+                    // Save to NVS
+                    esp_err_t save_ret = save_wifi_credentials(ssid, password);
+                    if (save_ret == ESP_OK) {
+                        ESP_LOGI("usbhandle", "WiFi credentials saved successfully: SSID=%s", ssid);
+
+                        // Optional: Send confirmation back to USB host
+                        char notify[128];
+                        size_t notify_len = snprintf(notify, sizeof(notify), "WIFI_CONFIGURED=%s\r\n", ssid);
+                        size_t written = tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0, (uint8_t*)notify, notify_len);
+                        if (written > 0) {
+                            tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, flush_timeout);
+                            ESP_LOGI("usbhandle", "Sent WiFi config confirmation to USB (%zu bytes)", written);
+                        }
+
+                        // Delay for host to read, then restart to apply new WiFi
+                        vTaskDelay(pdMS_TO_TICKS(2000));
+                        ESP_LOGI("usbhandle", "Restarting device to connect to new WiFi: %s", ssid);
+                        esp_restart();
+                    } else {
+                        ESP_LOGE("usbhandle", "Failed to save WiFi credentials: %s", esp_err_to_name(save_ret));
+
+                        // Optional: Send error notification to USB
+                        char error_notify[64];
+                        size_t error_len = snprintf(error_notify, sizeof(error_notify), "WIFI_CONFIG_FAILED\r\n");
+                        tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0, (uint8_t*)error_notify, error_len);
+                        tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, flush_timeout);
+                    }
+                } else {
+                    ESP_LOGW("usbhandle", "Invalid WiFi payload lengths: ssid=%zu (max 31), pass=%zu (max 63)", ssid_len, pass_len);
+                }
+            } else {
+                ESP_LOGW("usbhandle", "No comma found in WiFi message (expected 'WIFI=SSID,PASS')");
+            }
+
+            // Do not forward the WiFi config message itself; handle locally
+            esp_task_wdt_reset();
+            vTaskDelay(parse_delay);
+            continue;
+        }
+
+        // Chunked forwarding to handle limited CDC TX buffer (for non-WiFi messages)
         size_t offset = 0;
         size_t total_forwarded = 0;
         esp_err_t overall_flush_ret = ESP_OK;
@@ -318,3 +391,5 @@ void parse_and_usb_task(void *pvParameters) {
         vTaskDelay(parse_delay);
     }
 }
+
+

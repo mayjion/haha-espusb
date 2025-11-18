@@ -1,10 +1,10 @@
-#include "tcp_server.h"
-#include "protocol.h"  // Added: For frame building/parsing
-#include "usbhandle.h"  // Added: For tx_ring and app_queue
+#include "tcp_client.h"
+#include "protocol.h"  // For frame building/parsing
+#include "usbhandle.h"  // For tx_ring and app_queue
 #include <string.h>    // For memset, memcpy
 #include <sys/socket.h> // For send/recv
 
-static const char *TAG = "tcpserver";
+static const char *TAG = "tcpclient";
 client_t active_client = {0};
 SemaphoreHandle_t client_mutex = NULL;  // Added: For thread-safe access to active_client
 tx_ring_t tx_ring = {0};  // Moved: Shared with USB, initialized here or in usbhandle
@@ -147,10 +147,7 @@ esp_err_t init_system(void) {
 
     // WiFi init (now includes full stack: NVS + netif + event loop)
     wifi_config_init();  // ADDED: Full init (replaces manual nvs_flash_init)
-
-    // Load and start WiFi
-    load_wifi_credentials();
-    wifi_init_softap();
+    wifi_init_sta();     // Start STA connection
 
     // WDT init
     wdt_init(30000);  // Will be fixed in #2
@@ -161,7 +158,7 @@ esp_err_t init_system(void) {
         ESP_LOGE(TAG, "Failed to create client_mutex");
         return ESP_FAIL;
     }
-    ESP_LOGI(TAG, "client_mutex created OK");  // 添加：确认创建成功
+    ESP_LOGI(TAG, "client_mutex created OK"); 
     // Ring buffer init: Dynamic heap alloc to avoid .bss issues
     // TX ring
     tx_ring.buf = calloc(TX_BUFFER_SIZE, sizeof(uint8_t));  // Alloc + zero
@@ -225,7 +222,7 @@ esp_err_t rx_ring_append(const uint8_t *data, size_t len) {
 // New: Consume from RX ring (up to max_len, returns consumed)
 size_t rx_ring_consume(uint8_t *buf, size_t max_len) {
     if (xSemaphoreTake(rx_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {  // Increased to 100ms
-        ESP_LOGI("tcpserver", "RX mutex take timeout in consume (contention)");  // New: Diagnose
+        ESP_LOGI("tcpclient", "RX mutex take timeout in consume (contention)");  // New: Diagnose
         return 0;
     }
     size_t consumed = (rx_ring.len < max_len) ? rx_ring.len : max_len;
@@ -239,140 +236,121 @@ size_t rx_ring_consume(uint8_t *buf, size_t max_len) {
 }
 
 
-void tcp_server_task(void *pvParameters) {
-    esp_task_wdt_add(NULL);
-    esp_task_wdt_reset(); // Early reset
-    int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
-    if (sock < 0) {
-        ESP_LOGE(TAG, "Unable to create socket: errno %d", errno);
-        vTaskDelete(NULL);
-        return;
+// WiFi event handler
+static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        esp_wifi_connect();
+        ESP_LOGI(TAG, "WiFi disconnected, retrying connect");
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+        ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
     }
-    ESP_LOGI(TAG, "Socket created");
-    int opt = 1;
-    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    struct sockaddr_in dest_addr = {
-        .sin_addr.s_addr = htonl(INADDR_ANY),
-        .sin_family = AF_INET,
-        .sin_port = htons(PORT)
-    };
-    if (bind(sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr)) != 0) {
-        ESP_LOGE(TAG, "Socket unable to bind: errno %d", errno);
-        close(sock);
-        vTaskDelete(NULL);
-        return;
-    }
-    ESP_LOGI(TAG, "Socket bound, port %d", PORT);
-    if (listen(sock, 1) != 0) {
-        ESP_LOGE(TAG, "Error during listen: errno %d", errno);
-        close(sock);
-        vTaskDelete(NULL);
-        return;
-    }
-    const TickType_t loop_delay = pdMS_TO_TICKS(50); // 50ms outer loop for responsiveness
-    struct timeval accept_to = {0, 10000}; // Reduced to 10ms for better responsiveness
-    while (1) {
-        fd_set readfds;
-        FD_ZERO(&readfds);
-        FD_SET(sock, &readfds);
-        int sel_ret = select(sock + 1, &readfds, NULL, NULL, &accept_to);
-        if (sel_ret < 0) {
-            ESP_LOGE(TAG, "Accept select error: %d", errno);
-            esp_task_wdt_reset();
-            vTaskDelay(loop_delay);
-            continue;
-        } else if (sel_ret > 0 && FD_ISSET(sock, &readfds)) {
-            struct sockaddr_in source_addr;
-            socklen_t addr_len = sizeof(source_addr);
-            int client_sock = accept(sock, (struct sockaddr *)&source_addr, &addr_len);
-            if (client_sock < 0) {
-                ESP_LOGE(TAG, "Accept failed: errno %d", errno);
-                continue;
-            }
-            ESP_LOGI(TAG, "New client connected from " IPSTR ":%d",
-                     IP2STR((ip4_addr_t *)&source_addr.sin_addr), ntohs(source_addr.sin_port));
-            xSemaphoreTake(client_mutex, portMAX_DELAY);
-            active_client.sock = client_sock;
-            active_client.active = true;
-            active_client.addr = source_addr;
-            active_client.seq_tx = 1;
-            active_client.seq_rx = 1;
-            active_client.last_heartbeat = xTaskGetTickCount();
-            active_client.pending = false;
-            xSemaphoreGive(client_mutex);
-            // Set RX buffer size
-            int rx_buf_size = 64 * 1024; // 64KB for high-throughput
-            setsockopt(client_sock, SOL_SOCKET, SO_RCVBUF, &rx_buf_size, sizeof(rx_buf_size));
-            ESP_LOGI(TAG, "Set client RX buf to %d bytes", rx_buf_size);
-            // Set non-blocking mode for client_sock
-            int flags = fcntl(client_sock, F_GETFL, 0);
-            fcntl(client_sock, F_SETFL, flags | O_NONBLOCK);
-            // Inner client loop: non-blocking recv polling
-            uint8_t rx_buffer[RX_BUFFER_SIZE];
-            const TickType_t client_loop_delay = pdMS_TO_TICKS(10); // 10ms quick check
-            int drop_count = 0; // Track dropped bytes for potential connection close
-            while (active_client.active && client_sock >= 0) {
-                int total_read = 0;
-                int len = 0; // Declare len outside do-while for scope
-                // Drain loop: continuous recv until EAGAIN
-                do {
-                    len = recv(client_sock, rx_buffer, sizeof(rx_buffer), MSG_DONTWAIT);
-                    if (len > 0) {
-                        // ESP_LOGI(TAG, "Recv %d bytes from " IPSTR ":%d", len, IP2STR((ip4_addr_t *)&active_client.addr.sin_addr), ntohs(active_client.addr.sin_port));
-                        // ESP_LOG_BUFFER_HEX(TAG, rx_buffer, len);
-                        // Append to RX ring
-                        esp_err_t append_ret = rx_ring_append(rx_buffer, len);
-                        if (append_ret != ESP_OK) {
-                            ESP_LOGW(TAG, "RX append failed, dropping %d bytes", len);
-                            drop_count += len;
-                            if (drop_count > 1024 * 1024) { // If >1MB dropped, close to avoid waste
-                                ESP_LOGE(TAG, "Excessive drops (%d bytes), closing connection", drop_count);
-                                break;
-                            }
-                        } else {
-                            // ESP_LOGI(TAG, "Appended %d bytes to RX ring (now len=%zu)", len, rx_ring.len);
-                            drop_count = 0; // Reset on success
-                        }
-                        total_read += len;
-                        esp_task_wdt_reset(); // Reset post-recv
-                    } else if (len == 0) {
-                        ESP_LOGW(TAG, "Recv EOF from client");
-                        break; // Connection closed
-                    } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                        ESP_LOGE(TAG, "Recv error: %d", errno);
-                        break;
-                    }
-                } while (len > 0 && total_read < (64 * 1024)); // Limit total read per loop to ~64KB
-
-                if (drop_count > 0) {
-                    ESP_LOGW(TAG, "Dropped %d bytes this cycle", drop_count);
-                }
-
-                // Idle: heartbeat check (optional)
-                if (total_read == 0) {
-                    // Optional: check last_heartbeat, send ping if needed
-                    esp_task_wdt_reset(); // Every 10ms
-                }
-
-                vTaskDelay(client_loop_delay); // Yield every 10ms
-            }
-            ESP_LOGI(TAG, "Client disconnected (sock=%d), drops=%d", client_sock, drop_count);
-            xSemaphoreTake(client_mutex, portMAX_DELAY);
-            active_client.sock = -1;
-            active_client.active = false;
-            xSemaphoreGive(client_mutex);
-            shutdown(client_sock, SHUT_RDWR); // Graceful close
-            close(client_sock);
-            esp_task_wdt_reset(); // Post-disconnect
-        } else { // Accept timeout
-            esp_task_wdt_reset(); // Outer loop reset
-        }
-        vTaskDelay(loop_delay);
-    }
-    close(sock);
-    vTaskDelete(NULL);
 }
 
+void tcp_client_task(void *pvParameters) {
+    esp_task_wdt_add(NULL);
+    client_init();
+
+    // Register WiFi event handler for auto-reconnect
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
+
+    while (1) {
+        // Wait for WiFi connected (poll every 5s)
+        wifi_ap_record_t ap_info;
+        esp_err_t wifi_ret = esp_wifi_sta_get_ap_info(&ap_info);
+        if (wifi_ret != ESP_OK) {
+            ESP_LOGI(TAG, "WiFi not connected, retrying in 5s");
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            continue;
+        }
+        ESP_LOGI(TAG, "WiFi connected to %s, attempting TCP connect", ap_info.ssid);
+
+        // Create socket
+        int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (sock < 0) {
+            ESP_LOGE(TAG, "Unable to create socket: errno %d", errno);
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            continue;
+        }
+
+        // Set non-blocking
+        int flags = fcntl(sock, F_GETFL, 0);
+        fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+
+        // Server addr
+        struct sockaddr_in dest_addr;
+        dest_addr.sin_addr.s_addr = inet_addr(SERVER_IP);
+        dest_addr.sin_family = AF_INET;
+        dest_addr.sin_port = htons(PORT);
+        active_client.addr = dest_addr;
+
+        // Connect with timeout
+        int err = connect(sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+        if (err < 0 && errno != EINPROGRESS) {
+            ESP_LOGE(TAG, "Socket connect failed: errno %d", errno);
+            close(sock);
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            continue;
+        }
+
+        // Poll for connect
+        struct timeval timeout = { .tv_sec = 10, .tv_usec = 0 };
+        fd_set writefds;
+        FD_ZERO(&writefds);
+        FD_SET(sock, &writefds);
+        err = select(sock + 1, NULL, &writefds, NULL, &timeout);
+        if (err < 0) {
+            ESP_LOGE(TAG, "Select failed: errno %d", errno);
+            close(sock);
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            continue;
+        }
+        if (!FD_ISSET(sock, &writefds)) {
+            ESP_LOGW(TAG, "Connect timeout");
+            close(sock);
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            continue;
+        }
+
+        // Connected
+        xSemaphoreTake(client_mutex, portMAX_DELAY);
+        active_client.sock = sock;
+        active_client.active = true;
+        xSemaphoreGive(client_mutex);
+        ESP_LOGI(TAG, "TCP connected to %s:%d", SERVER_IP, PORT);
+
+        // RX loop
+        uint8_t rx_buf[RX_BUFFER_SIZE];
+        while (active_client.active) {
+            int rx_len = recv(sock, rx_buf, sizeof(rx_buf), MSG_DONTWAIT);
+            if (rx_len > 0) {
+                ESP_LOGD(TAG, "Received %d bytes from server", rx_len);
+                rx_ring_append(rx_buf, rx_len);
+            } else if (rx_len == 0) {
+                ESP_LOGW(TAG, "Server closed connection");
+                break;
+            } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                ESP_LOGE(TAG, "Recv error: %d", errno);
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));
+            esp_task_wdt_reset();
+        }
+
+        // Cleanup
+        xSemaphoreTake(client_mutex, portMAX_DELAY);
+        active_client.active = false;
+        shutdown(sock, 0);
+        close(sock);
+        active_client.sock = -1;
+        xSemaphoreGive(client_mutex);
+        ESP_LOGI(TAG, "TCP disconnected, retrying in 5s");
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+}
 
 void send_task(void *pvParameters) {
     esp_task_wdt_add(NULL);
@@ -399,16 +377,16 @@ void send_task(void *pvParameters) {
         // Fixed copy loop: Use for loop for exact chunk_size bytes
         size_t pos = tx_ring.tail;
         uint8_t temp_payload[MAX_TX_SIZE];
-        memset(temp_payload, 0, sizeof(temp_payload));  // 必须添加：清除栈垃圾
-        // ESP_LOGI(TAG, "Starting copy loop: chunk_size=%zu", chunk_size);  // 调试：确认 chunk_size
+        memset(temp_payload, 0, sizeof(temp_payload)); 
+        // ESP_LOGI(TAG, "Starting copy loop: chunk_size=%zu", chunk_size);  
         for (size_t i = 0; i < chunk_size; ++i) {
             temp_payload[i] = tx_ring.buf[pos];
-            pos = (pos + 1) % tx_ring.size;  // 修改：使用 tx_ring.size 而非 TX_BUFFER_SIZE（一致性）
-            // if (i < 5) {  // 调试：只日志前5个迭代，确认循环执行
+            pos = (pos + 1) % tx_ring.size; 
+    
             //     ESP_LOGI(TAG, "Copy i=%zu: temp[%zu]=0x%02X from buf[%zu]=0x%02X", i, i, temp_payload[i], (tx_ring.tail + i) % tx_ring.size, tx_ring.buf[(tx_ring.tail + i) % tx_ring.size]);
             // }
         }
-        // ESP_LOGI(TAG, "Copy loop complete: final pos=%zu", pos);  // 调试：确认循环结束
+        // ESP_LOGI(TAG, "Copy loop complete: final pos=%zu", pos); 
         size_t copied = chunk_size;
         ESP_LOGI(TAG, "TCP TX: %u bytes", copied);
         // ESP_LOG_BUFFER_HEX(TAG, temp_payload, copied);  
@@ -446,7 +424,6 @@ esp_err_t send_control_to_tcp(uint8_t type, const uint8_t *payload, uint16_t pay
         return ESP_FAIL;
     }
 
-    // 堆分配缓冲：frame (总帧), escaped_payload (转义后负载), crc_data (CRC 计算用)
     uint8_t *frame = malloc(FRAME_BUFFER_SIZE);  // ~2.3KB
     uint8_t *escaped_payload = malloc(MAX_TX_SIZE * 2);  // ~2KB
     uint8_t *crc_data = malloc(5 + MAX_TX_SIZE);  // ~1KB
@@ -459,7 +436,6 @@ esp_err_t send_control_to_tcp(uint8_t type, const uint8_t *payload, uint16_t pay
         return ESP_FAIL;
     }
 
-    // 清零缓冲
     memset(frame, 0, FRAME_BUFFER_SIZE);
     memset(escaped_payload, 0, MAX_TX_SIZE * 2);
     memset(crc_data, 0, 5 + MAX_TX_SIZE);
@@ -470,11 +446,9 @@ esp_err_t send_control_to_tcp(uint8_t type, const uint8_t *payload, uint16_t pay
     // Skip all other logic: no header build, no seq, no CRC computation, no escaping
     size_t frame_len = payload_len;  // Original length
 
-    // 日志：确认构建
     ESP_LOGI(TAG, "Built control frame: type=0x%02X, seq=%u, payload_len=%u, crc=0x%04X, total_frame=%zu bytes", 
              type, 0, payload_len, 0, frame_len);
 
-    // 发送（带重试）
     esp_err_t ret = ESP_FAIL;
     for (int retry = 0; retry < PROTO_MAX_RETRIES; retry++) {
         int sent = send(active_client.sock, frame, frame_len, 0);
@@ -487,7 +461,6 @@ esp_err_t send_control_to_tcp(uint8_t type, const uint8_t *payload, uint16_t pay
         vTaskDelay(pdMS_TO_TICKS(PROTO_TIMEOUT_MS * (retry + 1)));
     }
 
-    // 释放堆缓冲
     free(frame);
     free(escaped_payload);
     free(crc_data);
@@ -571,12 +544,12 @@ void app_main(void) {
     }
 
     authorcodeverify();
-    xTaskCreatePinnedToCore(tcp_server_task, "tcp_server", 16384, NULL, 4, NULL, 1);
+    xTaskCreatePinnedToCore(tcp_client_task, "tcp_client", 16384, NULL, 4, NULL, 1);
     xTaskCreatePinnedToCore(usb_to_tcp_task, "usb_to_tcp", 12288, NULL, 4, NULL, 1);
     xTaskCreatePinnedToCore(send_task, "send_task", 12288, NULL, 4, NULL, 1);
-    xTaskCreatePinnedToCore(parse_and_usb_task, "parse_usb", 12288, NULL, 4, NULL, 1);
+    xTaskCreatePinnedToCore(parse_and_usb_task, "parse_usb", 16384, NULL, 4, NULL, 1);
     xTaskCreatePinnedToCore(button_task, "button_task", 4096, NULL, 2, NULL, 0);  // Core 0 for GPIO
-    xTaskCreatePinnedToCore(led_task, "led_task", 2048, NULL, 1, NULL, 0);
+    xTaskCreatePinnedToCore(led_task, "led_task", 4096, NULL, 1, NULL, 0);
     ESP_LOGI(TAG, "Tasks created, app_main complete");
     
 }
