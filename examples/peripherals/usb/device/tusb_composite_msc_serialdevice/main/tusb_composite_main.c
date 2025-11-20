@@ -5,6 +5,7 @@
 #include <errno.h>
 
 #define BROADCAST_THRESHOLD 2
+#define CDC_TX_CHUNK_SIZE 1024  // 匹配新的CONFIG_TINYUSB_CDC_TX_BUFSIZE=1024
 
 static const char *TAG = "example_main";
 static uint8_t cdc_rx_buf[CONFIG_TINYUSB_CDC_RX_BUFSIZE];
@@ -17,6 +18,17 @@ static char current_ssid[32] = DEFAULT_ESP_WIFI_SSID;
 static char current_password[64] = DEFAULT_ESP_WIFI_PASS;
 static bool factory_state = true;
 static int udp_sock = -1;
+
+// 统计计数器：用于监控丢包
+static size_t total_received_bytes = 0;
+static size_t total_forwarded_bytes = 0;
+static size_t lost_bytes = 0;
+
+void print_stats(void) {
+    ESP_LOGI(TAG, "STATS: Received=%zu B, Forwarded=%zu B, Lost=%zu B (%.2f%%)",
+             total_received_bytes, total_forwarded_bytes, lost_bytes,
+             total_received_bytes > 0 ? (100.0 * lost_bytes / total_received_bytes) : 0);
+}
 
 // Device descriptor
 static const tusb_desc_device_t desc_device = {
@@ -68,6 +80,7 @@ void tinyusb_cdc_rx_callback(int itf, cdcacm_event_t *event) {
         memcpy(msg.buf, cdc_rx_buf, rx_size);
         if (xQueueSend(app_queue, &msg, 0) != pdTRUE) {
             ESP_LOGW(TAG, "Queue full, packet dropped");
+            lost_bytes += rx_size;  // 统计USB->TCP丢包
         }
     }
 }
@@ -121,6 +134,7 @@ static void send_to_client(const uint8_t *data, size_t len, const char *log_pref
         }
     }
 }
+
 void tinyusb_cdc_line_coding_changed_callback(int itf, cdcacm_event_t *event) {
     cdcacm_event_line_coding_changed_data_t *coding = &event->line_coding_changed_data;
     char message[128];
@@ -332,6 +346,50 @@ static void usb_to_tcp_task(void *pvParameters) {
     }
 }
 
+// 新增：可靠地将数据分块发送到USB CDC，低延迟模式
+static esp_err_t forward_to_usb(const uint8_t *data, size_t len, int client_id) {
+    size_t offset = 0;
+    size_t forwarded_in_call = 0;
+    esp_err_t overall_ret = ESP_OK;
+    while (offset < len) {
+        size_t to_write = len - offset;
+        // 限制单次写大小为CDC_TX_CHUNK_SIZE
+        if (to_write > CDC_TX_CHUNK_SIZE) to_write = CDC_TX_CHUNK_SIZE;
+
+        size_t queued = tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0, data + offset, to_write);
+        if (queued < to_write) {
+            ESP_LOGW(TAG, "USB queue only accepted %zu/%zu bytes for chunk from client %d", queued, to_write, client_id);
+            to_write = queued;  // 只推进已队列的部分
+        }
+
+        esp_err_t flush_ret = ESP_FAIL;
+        // 针对小包（<64字节）使用更短超时和更少重试，确保低延迟
+        int max_retries = (to_write < 64) ? 3 : 10;
+        TickType_t flush_timeout = (to_write < 64) ? pdMS_TO_TICKS(5) : pdMS_TO_TICKS(20);
+        for (int retry = 0; retry < max_retries; retry++) {
+            flush_ret = tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, flush_timeout);
+            if (flush_ret == ESP_OK) break;
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+        if (flush_ret != ESP_OK) {
+            ESP_LOGE(TAG, "USB flush failed for %zu bytes from client %d after %d retries", to_write, client_id, max_retries);
+            overall_ret = ESP_FAIL;
+            lost_bytes += to_write;  // 统计TCP->USB丢包
+        } else {
+            forwarded_in_call += to_write;
+        }
+
+        offset += to_write;
+    }
+    total_forwarded_bytes += forwarded_in_call;
+    if (overall_ret != ESP_OK) {
+        ESP_LOGE(TAG, "Partial failure forwarding %zu/%zu bytes from client %d to USB", forwarded_in_call, len, client_id);
+    } else {
+        ESP_LOGD(TAG, "Successfully forwarded %zu bytes from client %d to USB", len, client_id);
+    }
+    return overall_ret;
+}
+
 static void tcp_server_task(void *pvParameters) {
     struct sockaddr_in dest_addr = { .sin_addr.s_addr = htonl(INADDR_ANY), .sin_family = AF_INET, .sin_port = htons(PORT) };
     int listen_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
@@ -341,8 +399,9 @@ static void tcp_server_task(void *pvParameters) {
     listen(listen_sock, MAX_CLIENTS);  // backlog改为MAX_CLIENTS
 
     fd_set readfds;
-    struct timeval timeout = { .tv_sec = 1, .tv_usec = 0 };  // 1s超时，检查accept
+    struct timeval timeout = { .tv_sec = 0, .tv_usec = 5000 };  // 进一步减小超时到5ms，更高响应性
 
+    TickType_t last_stat_time = xTaskGetTickCount();
     while (1) {
         FD_ZERO(&readfds);
         FD_SET(listen_sock, &readfds);  // 监听listen_sock
@@ -359,7 +418,7 @@ static void tcp_server_task(void *pvParameters) {
         int activity = select(max_fd + 1, &readfds, NULL, NULL, &timeout);
         if (activity < 0) {
             ESP_LOGE(TAG, "select error");
-            vTaskDelay(pdMS_TO_TICKS(100));
+            vTaskDelay(pdMS_TO_TICKS(5));  // 减小延迟
             continue;
         }
 
@@ -379,10 +438,15 @@ static void tcp_server_task(void *pvParameters) {
                         }
                     }
                     if (slot != -1) {
+                        // 设置非阻塞模式，提高select效率
+                        fcntl(sock, F_SETFL, O_NONBLOCK);
+
                         int nodelay = 1;
                         setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
-                        int sndbuf = 4096;
+                        int sndbuf = 32768;  // 进一步增大发送缓冲到32KB
                         setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+                        int rcvbuf = 32768;  // 增大接收缓冲到32KB，防高吞吐溢出
+                        setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
                         clients[slot].sock = sock;
                         clients[slot].active = true;
@@ -402,48 +466,61 @@ static void tcp_server_task(void *pvParameters) {
         // 处理客户端数据
         for (int i = 0; i < MAX_CLIENTS; i++) {
             if (clients[i].active && clients[i].sock >= 0 && FD_ISSET(clients[i].sock, &readfds)) {
-                uint8_t rx_buffer[UART_BUF_SIZE];
-                int len = recv(clients[i].sock, rx_buffer, UART_BUF_SIZE, 0);
-                if (len <= 0) {
+                uint8_t rx_buffer[2048];  // 进一步增大缓冲区到2048，处理更大突发
+                int total_received = 0;
+                while (1) {  // 循环读取所有可用数据，防止部分读取导致延迟或丢失
+                    int len = recv(clients[i].sock, rx_buffer + total_received, sizeof(rx_buffer) - total_received, 0);
+                    if (len > 0) {
+                        total_received += len;
+                        if (total_received >= sizeof(rx_buffer)) {
+                            // 缓冲满，处理当前，下次select处理剩余
+                            ESP_LOGW(TAG, "Recv buffer full for client %d, processed %d bytes, more pending", i, total_received);
+                            break;
+                        }
+                    } else if (len == 0) {
+                        // 优雅关闭
+                        break;
+                    } else {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                            // 无更多数据
+                            break;
+                        } else {
+                            // 错误
+                            break;
+                        }
+                    }
+                }
+
+                if (total_received <= 0) {
                     // 断开
                     close(clients[i].sock);
                     clients[i].sock = -1;
                     clients[i].active = false;
                     num_active_clients--;
                     ESP_LOGI(TAG, "Client %d disconnected, total active: %d", i, num_active_clients);
-                } else {
-                    if (num_active_clients > 1) {
-                        // 提取IP地址最后一个数字
-                        const char *client_ip = inet_ntoa(clients[i].addr.sin_addr);
-                        const char *last_octet = strrchr(client_ip, '.') ? strrchr(client_ip, '.') + 1 : "0";
-                        char dev_prefix[16];
-                        snprintf(dev_prefix, sizeof(dev_prefix), "\r\n[dev-%s]\r\n", last_octet);
-                        size_t prefix_len = strlen(dev_prefix);
-                        // 先转发前缀到USB
-                        size_t queued_prefix = tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0, (uint8_t *)dev_prefix, prefix_len);
-                        esp_err_t flush_ret_prefix = ESP_FAIL;
-                        for (int retry = 0; retry < 5; retry++) {
-                            flush_ret_prefix = tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, pdMS_TO_TICKS(CDC_FLUSH_TIMEOUT_MS));
-                            if (flush_ret_prefix == ESP_OK && queued_prefix == prefix_len) break;
-                        }
-                        if (flush_ret_prefix != ESP_OK || queued_prefix != prefix_len) {
-                            ESP_LOGE(TAG, "Failed to send prefix '%s' from client %d to USB after retries", dev_prefix, i);
-                        }
-                    }
-     
-                    // 然后转发原数据到USB
-                    size_t queued_data = tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0, rx_buffer, len);
-                    esp_err_t flush_ret_data = ESP_FAIL;
-                    for (int retry = 0; retry < 5; retry++) {
-                        flush_ret_data = tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, pdMS_TO_TICKS(CDC_FLUSH_TIMEOUT_MS));
-                        if (flush_ret_data == ESP_OK && queued_data == len) break;
-                    }
-                    if (flush_ret_data != ESP_OK || queued_data != len) {
-                        ESP_LOGE(TAG, "Failed to forward %d bytes from client %d to USB after retries", len, i);
-                    }
-                    // ESP_LOGD(TAG, "[dev-%s] Forwarded prefix and %d bytes of data from client %d to USB", last_octet, len, i);
+                    continue;
+                }
+
+                total_received_bytes += total_received;  // 更新统计
+
+                // 每10s打印一次统计
+                if (xTaskGetTickCount() - last_stat_time > pdMS_TO_TICKS(10000)) {
+                    print_stats();
+                    last_stat_time = xTaskGetTickCount();
+                }
+
+                // 处理接收到的数据（前缀 + 数据）
+                esp_err_t ret = ESP_OK;
+  
+                // 然后转发原数据到USB
+                ret = forward_to_usb(rx_buffer, total_received, i);
+                if (ret != ESP_OK) {
+                    ESP_LOGE(TAG, "Failed to forward %d bytes from client %d to USB", total_received, i);
                 }
             }
+        }
+        if (activity == 0) {
+            vTaskDelay(pdMS_TO_TICKS(1));  // 无活动时微延迟，节省CPU
         }
     }
     close(listen_sock);
@@ -517,7 +594,8 @@ static esp_err_t init_system(void) {
     esp_log_level_set("tusb", ESP_LOG_DEBUG);
     size_t free_heap = esp_get_free_heap_size();
     ESP_LOGI(TAG, "Free heap before queue creation: %zu bytes", free_heap);
-    app_queue = xQueueCreate(QUEUE_SIZE, sizeof(app_message_t));
+    // 增大队列大小到100，防USB->TCP方向满
+    app_queue = xQueueCreate(100, sizeof(app_message_t));
     if (!app_queue) {
         ESP_LOGE(TAG, "Failed to create app_queue, free heap: %zu bytes", free_heap);
         return ESP_FAIL;
@@ -530,6 +608,10 @@ static esp_err_t init_system(void) {
         clients[i].sock = -1;
         clients[i].active = false;
     }
+    // 初始化统计
+    total_received_bytes = 0;
+    total_forwarded_bytes = 0;
+    lost_bytes = 0;
     return ESP_OK;
 }
 
