@@ -94,24 +94,49 @@ void tinyusb_cdc_line_state_changed_callback(int itf, cdcacm_event_t *event) {
 
 static void send_to_client(const uint8_t *data, size_t len, const char *log_prefix) {
     if (num_active_clients <= BROADCAST_THRESHOLD) {
-        // Polling send via TCP for small number of clients
         for (int i = 0; i < MAX_CLIENTS; i++) {
             if (clients[i].active && clients[i].sock >= 0) {
-                int sent = send(clients[i].sock, data, len, 0);
-                if (sent < 0) {
-                    ESP_LOGW(TAG, "%s TCP send failed for client %d, closing", log_prefix, i);
-                    close(clients[i].sock);
-                    clients[i].sock = -1;
-                    clients[i].active = false;
-                    num_active_clients--;
-                } else if (sent == len) {
-                    ESP_LOGD(TAG, "%s Sent %zu bytes to client %d", log_prefix, len, i);
+                size_t remaining = len;
+                size_t total_sent = 0;
+                bool send_success = true;
+                int max_retries = 20;  // ÏÞÖØÊÔ£¬·ÀÎÞÏÞÑ­»·
+                int retry_count = 0;
+                while (remaining > 0 && send_success && retry_count < max_retries) {
+                    ssize_t sent = send(clients[i].sock, data + total_sent, remaining, MSG_DONTWAIT | MSG_NOSIGNAL);
+                    if (sent < 0) {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                            retry_count++;
+                            vTaskDelay(pdMS_TO_TICKS(2));  // ÉÔÔöÑÓ³Ù£¬¼õCPU
+                            continue;
+                        } else {
+                            ESP_LOGW(TAG, "%s TCP send error for client %d: %s, closing", log_prefix, i, strerror(errno));
+                            close(clients[i].sock);
+                            clients[i].sock = -1;
+                            clients[i].active = false;
+                            num_active_clients--;
+                            send_success = false;
+                            break;
+                        }
+                    } else if (sent == 0) {
+                        ESP_LOGI(TAG, "%s Client %d closed during send", log_prefix, i);
+                        close(clients[i].sock);
+                        clients[i].sock = -1;
+                        clients[i].active = false;
+                        num_active_clients--;
+                        send_success = false;
+                        break;
+                    } else {
+                        total_sent += sent;
+                        remaining -= sent;
+                        retry_count = 0;  
+                    }
+                }
+                if (!send_success || total_sent < len) {
+                    ESP_LOGW(TAG, "%s Failed to send all %zu/%zu to client %d (retries:%d), partial drop", 
+                             log_prefix, total_sent, len, i, retry_count);
+                    
                 } else {
-                    ESP_LOGW(TAG, "%s Partial send to client %d: %d/%zu, closing", log_prefix, i, sent, len);
-                    close(clients[i].sock);
-                    clients[i].sock = -1;
-                    clients[i].active = false;
-                    num_active_clients--;
+                    ESP_LOGD(TAG, "%s Sent %zu bytes to client %d", log_prefix, len, i);
                 }
             }
         }
@@ -134,6 +159,7 @@ static void send_to_client(const uint8_t *data, size_t len, const char *log_pref
         }
     }
 }
+
 
 void tinyusb_cdc_line_coding_changed_callback(int itf, cdcacm_event_t *event) {
     cdcacm_event_line_coding_changed_data_t *coding = &event->line_coding_changed_data;
