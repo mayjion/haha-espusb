@@ -1,5 +1,5 @@
-#ifndef _TUSB_COMPOSITE_MAIN_H_
-#define _TUSB_COMPOSITE_MAIN_H_
+#ifndef _TUSB_COMPOSITE_MAIN_CLIENT_H_
+#define _TUSB_COMPOSITE_MAIN_CLIENT_H_
 
 #include <stdio.h>
 #include "esp_log.h"
@@ -14,12 +14,14 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "driver/gpio.h"
+#include <stdint.h>
 
-#define QUEUE_SIZE 200
+#define QUEUE_SIZE 300
 #define CONFIG_TINYUSB_CDC_RX_BUFSIZE 512
 #define DEFAULT_ESP_WIFI_SSID "FUNLIGHT"
 #define DEFAULT_ESP_WIFI_PASS "funlight"
 #define ESP_WIFI_CHANNEL 0
+#define SERVER_IP "192.168.57.176"
 #define PORT 12345
 #define UART_BUF_SIZE 1024
 #define CDC_FLUSH_TIMEOUT_MS 50
@@ -32,21 +34,19 @@
 #define NVS_NAMESPACE "config"
 #define NVS_KEY_SSID "wifi_ssid"
 #define NVS_KEY_PASS "wifi_pass"
-#define BROADCAST_THRESHOLD 2
-#define CDC_TX_CHUNK_SIZE 1024  // 匹配新的CONFIG_TINYUSB_CDC_TX_BUFSIZE=1024
-#define MAX_CLIENTS 8
-#define THROUGHPUT_LOG_INTERVAL 1000  // ms, for 1-second logging
+#define THROUGHPUT_LOG_INTERVAL 5000  // 5s for faster feedback
+#define RX_BUFFER_SIZE 2048
+#define CDC_TX_CHUNK_SIZE 1024
+#define MAX_RETRIES 20
+#define STALL_TIMEOUT_MS 500
+#define CONNECT_TIMEOUT_S 10
+#define RECONNECT_DELAY_MS 5000
+#define WDT_TIMEOUT_S 10
 
 typedef struct {
     uint8_t buf[CONFIG_TINYUSB_CDC_RX_BUFSIZE];
     size_t buf_len;
     int itf;
 } app_message_t;
-
-typedef struct {
-    int sock;              // 客户端socket，-1表示空闲
-    bool active;           // 连接活跃
-    struct sockaddr_in addr;  // 客户端地址（用于日志）
-} client_t;
 
 #endif

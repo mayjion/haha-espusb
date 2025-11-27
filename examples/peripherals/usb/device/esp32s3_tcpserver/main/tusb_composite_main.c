@@ -4,8 +4,7 @@
 #include <fcntl.h>
 #include <errno.h>
 
-#define BROADCAST_THRESHOLD 2
-#define CDC_TX_CHUNK_SIZE 1024  // 匹配新的CONFIG_TINYUSB_CDC_TX_BUFSIZE=1024
+
 
 static const char *TAG = "example_main";
 static uint8_t cdc_rx_buf[CONFIG_TINYUSB_CDC_RX_BUFSIZE];
@@ -62,19 +61,10 @@ static const uint8_t desc_configuration[] = {
 static const char *string_desc_arr[] = {
     (const char[]){0x09, 0x04}, // Language: English (US)
     "Manufacturer",
-    "ESP32-S2 CDC Device",
+    "ESP32-S3 CDC Device",
     "1234567890",
     "CDC Interface"
 };
-
-static void update_log_prefix(const char *client_ip) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    struct tm *tm_info = gmtime(&tv.tv_sec);
-    const char *last_octet = strrchr(client_ip, '.') ? strrchr(client_ip, '.') + 1 : "0";
-    snprintf(cached_log_prefix, sizeof(cached_log_prefix), "[%02d:%02d:%02d.%03d][device %s]",
-             tm_info->tm_hour, tm_info->tm_min, tm_info->tm_sec, (int)(tv.tv_usec / 1000), last_octet);
-}
 
 void tinyusb_cdc_rx_callback(int itf, cdcacm_event_t *event) {
     size_t rx_size = 0;
@@ -332,7 +322,6 @@ static void button_task(void *pvParameters) {
                 snprintf(mac_str, sizeof(mac_str), "%02X%02X%02X%02X%02X%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
                 snprintf(new_ssid, sizeof(new_ssid), "FUNLIGHT-%s", &mac_str[8]);
                 snprintf(new_password, sizeof(new_password), "funlight-%s", &mac_str[8]);
-                update_log_prefix("0.0.0.0");
                 char message[128];
                 snprintf(message, sizeof(message), "WIFI=%s,%s\r\n", new_ssid, new_password);
                 send_to_client((uint8_t *)message, strlen(message), cached_log_prefix);
@@ -401,7 +390,6 @@ static void usb_to_tcp_task(void *pvParameters) {
     app_message_t msg;
     while (1) {
         if (xQueueReceive(app_queue, &msg, portMAX_DELAY)) {
-            update_log_prefix("0.0.0.0");
             send_to_client(msg.buf, msg.buf_len, cached_log_prefix);
         }
     }
@@ -670,7 +658,7 @@ static esp_err_t init_system(void) {
     size_t free_heap = esp_get_free_heap_size();
     ESP_LOGI(TAG, "Free heap before queue creation: %zu bytes", free_heap);
     // 增大队列大小到100，防USB->TCP方向满
-    app_queue = xQueueCreate(200, sizeof(app_message_t));
+    app_queue = xQueueCreate(QUEUE_SIZE, sizeof(app_message_t));
     if (!app_queue) {
         ESP_LOGE(TAG, "Failed to create app_queue, free heap: %zu bytes", free_heap);
         return ESP_FAIL;
